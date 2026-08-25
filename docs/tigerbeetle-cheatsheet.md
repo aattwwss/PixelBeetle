@@ -1,146 +1,116 @@
-# TigerBeetle cheatsheet (verified against docs.tigerbeetle.com + go client v0.17.9)
+# TigerBeetle cheat sheet (verified against docs.tigerbeetle.com + tigerbeetle-go v0.17.9)
 
-Fetched 2026-08-26. Source pages: `/concepts/` (via `/coding/data-modeling`),
-`/coding/two-phase-transfers`, `/coding/requests`, `/coding/time`,
-`/coding/reliable-transaction-submission`, `/coding/recipes/balance-bounds`,
-`/reference/account`, `/reference/transfer`, `/reference/requests/create_transfers`.
-Go bindings cross-checked against `github.com/tigerbeetle/tigerbeetle-go@v0.17.9`
-(`bindings.go`, `tb_client.go`, `tb_client_test.go`).
+Fetched 2026-08-26. Focus: what PixelBeetle needs — two-phase transfers,
+balance-bound invariants, batching, idempotency, queries.
 
-## Corrections to our earlier assumptions
+## The decisive fact for our rewrite: pessimistic pending transfers
 
-- **Error name is `exceeds_credits`, not `exceeded_credits`.** Go constant:
-  `TransferExceedsCredits = 54` (debit side), `TransferExceedsDebits = 55`.
-- **The Go client does NOT use a sparse results array.** `CreateTransfers`
-  returns `results[i]` ↔ `transfers[i]`, same length and order, including
-  failures (`tb_client_test.go` asserts `results[0].Status ==
-  TransferLinkedEventFailed` etc.). The earlier worry that "Reserved holds the
-  failing index" was wrong for this version.
-- **Batch-of-1 is mostly a non-issue for us.** The Go client auto-batches:
-  one shared client, at most one in-flight request, and it *accumulates*
-  concurrent submissions while awaiting the previous reply. Our many
-  concurrent `Claim()` goroutines sharing one client already pack. No custom
-  chained-batcher needed (the reference.md TigerFans slowdown was a Python
-  event-loop artifact, not a TB requirement).
-- **Pendings are pessimistic**: balance invariants are checked at pending
-  *creation*, not post time. This is what makes the pixel-semaphore design
-  work — a second claim fails immediately with `exceeds_credits`.
+From /coding/two-phase-transfers/ ("Interaction with Account Invariants" and
+"Pessimistic Pending Transfers"):
 
-## Account flags (the ones that matter)
+> If an account with debits_must_not_exceed_credits has credits_posted = 100
+> and debits_posted = 70 and a pending transfer is started causing the account
+> to have debits_pending = 50, **the pending transfer will fail** [at creation].
+> It will not wait to get to posted status to fail.
 
-- `debits_must_not_exceed_credits` — reject a transfer when
-  `debits_pending + debits_posted + transfer.amount > credits_posted`.
-  (Note: only *posted* credits count as spendable; pending credits do not.)
-- `credits_must_not_exceed_debits` — the mirror.
-  Mutually exclusive with the above.
-- `history` — retain balance history; required for `get_account_balances`.
-- `closed` — reject new transfers except voiding still-pending ones.
-- `linked` — this event commits iff the next one in the batch does
-  (chained; last link has no flag).
-- `imported` — client-defined timestamps (avoid unless importing history).
+**Pending amounts count toward must-not-exceed invariants at create time.**
+This is what lets TigerBeetle itself reject a second concurrent claim on a
+pixel: fund the pixel with balance=1, claims are debits; the 2nd concurrent
+pending overdraws → rejected atomically by the DB. No app lock needed.
 
-Balance fields (all start 0, updated only by transfers):
-`debits_pending` (reserved by pending debits), `debits_posted`,
-`credits_pending`, `credits_posted`. Pending reserves are released on
-post/void/expire.
+Result statuses (Go constants, bindings.go):
+- `TransferExceedsCredits` (54) — debit account has
+  `debits_must_not_exceed_credits`, `debits_pending + debits_posted +
+  transfer.amount > credits_posted`. **Transient**: retrying the same id gives
+  the same outcome.
+- `TransferExceedsDebits` (55) — mirror image on credit side.
+- `TransferPendingTransferExpired` (35) — post/void against an expired pending.
+- `TransferCreated` (0xFFFFFFFF) — success.
 
-## Two-phase transfers
+## Account model for pixel exclusivity (the rewrite)
 
-- `flags.pending` reserves the amount into the debit account's
-  `debits_pending` / credit account's `credits_pending`; posted balances
-  untouched.
-- Resolve with a NEW transfer (immutable history) carrying:
-  - `post_pending_transfer` + `pending_id` — post. Amount may be `0` or
-    `AMOUNT_MAX` (= full) or a partial amount.
-  - `void_pending_transfer` + `pending_id` — void. Amount must be `0` or
-    exactly the pending's amount.
-  - `debit_account_id` / `credit_account_id` / `ledger` / `code` may be
-    zero, else must match the pending exactly (we hit this: code must repeat).
-- `timeout` is an interval in **seconds**, measured from arrival at the
-  primary (not client-supplied absolute time). Passed as `0` normally;
-  the cluster assigns the timestamp.
-- A pending resolves exactly once; resolving twice yields
-  `pending_transfer_already_posted` / `..._already_voided` /
-  `pending_transfer_expired` (Go: 33 / 34 / 35).
-- Timeout expiry frees the reserved amount (CDC emits `two_phase_expired`).
+```
+create account pixel_<x>_<y>: flags = {DebitsMustNotExceedCredits}, ledger=1
+fund once:                    transfer system_pool -> pixel, amount=1
 
-## The pixel-semaphore design (our rewrite target)
+claim:    PENDING transfer  pixel -> system_pool, amount=1, code=color|base,
+          user_data_128=player, timeout=3s
+          → 2nd concurrent claim fails at TB with ExceedsCredits ✓
+confirm:  ONE batch [post_pending leg, re-fund transfer pool -> pixel amount=1]
+          (batches commit atomically; events apply in series)
+cancel:   void_pending leg → balance restored automatically
+expiry:   timeout elapses → TB restores balance automatically
+```
 
-Enforce "one claim per pixel at a time" inside TigerBeetle, not in memory:
+Notes:
+- create_accounts and create_transfers are different requests; can't mix in
+  one message ("a single request can create multiple transfers but cannot
+  create both accounts and transfers"). Account creation then funding =
+  two sequential requests.
+- Post/void legs: id must be unique/new; pending_id references the pending;
+  debit/credit accounts, ledger, code may be zero or MUST match the pending.
+  Amount < pending amount = partial post (we always use full/zero).
+- A pending can be resolved exactly once: `pending_transfer_already_posted /
+  already_voided / expired` otherwise.
 
-1. **Pixel account**: `flags.debits_must_not_exceed_credits`.
-2. **Fund once**: posted credit of 1 into the pixel (debit `system_pool`).
-   Use a deterministic fund-transfer id (derived from pixel id) so
-   re-running after a restart is idempotent (`exists` = ok).
-3. **Claim** = pending transfer `debit pixel 1, credit system_pool 1`.
-   - First claim: `0 + 0 + 1 > 1`? no → ok, `debits_pending = 1`.
-   - Concurrent second claim: `1 + 0 + 1 > 1`? yes → `exceeds_credits`.
-     **The database rejects the contender; no app-level lock needed.**
-4. **Confirm** = one linked batch of two transfers:
-   - `post_pending_transfer` (posts the claim),
-   - re-fund: `debit system_pool 1, credit pixel 1` (plain, posted).
-   Net: `credits_posted += 1`, `debits_posted += 1` → still exactly 1
-   spendable unit. `debits_posted` = version counter.
-5. **Cancel** = `void_pending_transfer` (restores the unit).
-6. **Expire** = TB auto-voids; same effect as cancel.
+## Two-phase essentials (/coding/two-phase-transfers/)
 
-Cost vs current model: +1 transfer per confirm (re-fund) and a one-time
-fund per pixel. `system_pool` drifts by −1 per pixel (offset by pixels'
-+1; double-entry sums stay consistent).
+- Pending reserves into `debits_pending`/`credits_pending`; posted fields move
+  only on post. Void restores; timeout restores.
+- Timeouts are **intervals in seconds**, not absolute timestamps.
+- Completing a two-phase transfer creates a NEW transfer (second leg); the
+  pending is never modified. All transfers immutable.
 
-### Open question to verify live
+## Batching & clients (/coding/requests/)
 
-Whether an *expired-but-not-yet-observed* pending still holds its
-reservation when the very next claim lands right at the timeout boundary.
-If TB reaps lazily, a claim at t+3.001s may get one `exceeds_credits`;
-retry with a fresh UUIDv7 succeeds. Handle by treating `exceeds_credits`
-as "retry/contended" and surfacing a clear 409, not an internal error.
+- Max batch: **8189 events** per request for lookup/create ops.
+- "The cluster commits an entire request at once. Events are applied in
+  series, such that successive events observe the effects of previous ones."
+  → post+re-fund in one batch is safe and atomic.
+- **Automatic batching exists in clients**: "The TigerBeetle client should be
+  shared across threads… it automatically groups together batches of small
+  sizes into one request." Client has at most one in-flight request and
+  accumulates while waiting. (This softens the TigerFans lesson: their custom
+  LiveBatcher predates/parallels this; still worth measuring, but no hand
+  -rolled batching layer needed up front.)
+- Requests execute at most once; requests do not time out — clients retry
+  internally until answered.
 
-## Batching & throughput
+## Idempotency & reliable submission (/coding/reliable-transaction-submission/)
 
-- Max batch: **8189 events** per request type (`create_transfers` included).
-- **One client per process, shared across goroutines.** The client holds at
-  most one in-flight request and packs concurrent submissions while waiting.
-- Do not artificially delay to build batches — let concurrency do it.
-- All events in a request commit atomically (all-or-nothing), though
-  individual events can fail (non-linked).
+- Transfer/account ids are idempotency keys: resubmitting the same id yields
+  `exists` (or created exactly once). Generate ids on the *client* side of the
+  API boundary when real clients exist; persist before sending; retry with the
+  SAME id.
+- Transient errors (exceeded_*) are deterministic per id.
 
-## Idempotency & reliable submission
+## Queries (/reference/query-filter/, query_transfers/query_accounts)
 
-- The *client* (browser/app) generates the transfer/account id and persists
-  it before sending; retries reuse the same id.
-- Re-submitting the same id returns `exists` (Go `TransferExists = 46`,
-  `TransferCreated = 0xFFFFFFFF`), or `*ExistsWithDifferent*` (36–45, 67)
-  if fields differ.
-- Requests do not time out client-side; the client keeps retrying until a
-  reply. So network errors are safe to retry with the same id.
+Filter fields: user_data_128/64/32, ledger, code, timestamp_min/max
+(both inclusive), limit (>0, bounded by max message size). Pagination = page
+by last result's timestamp (adjust min/max). Ordering follows timestamps.
+Useful for boot-time cache warm-up without CDC: query_transfers with
+code filter + timestamp ranges.
 
-## Statuses we care about (Go v0.17.9)
+## Ops notes
 
-| Constant | Value | Meaning |
-|---|---|---|
-| `TransferCreated` | `0xFFFFFFFF` | success |
-| `TransferExists` | `46` | idempotent success |
-| `TransferExceedsCredits` | `54` | contention — overdraw on debit side |
-| `TransferExceedsDebits` | `55` | contention — credit side |
-| `TransferPendingTransferAlreadyPosted` | `33` | post retried |
-| `TransferPendingTransferAlreadyVoided` | `34` | void retried |
-| `TransferPendingTransferExpired` | `35` | resolved by timeout |
+- Native binaries preferred over Docker (see scripts/dev-cluster.sh).
+- 3 replicas tolerate 1 failure (quorum 2f+1).
+- CDC (`tigerbeetle amqp ...`) emits two_phase_pending/posted/voided/expired;
+  body carries full transfer + point-in-time balances; use body timestamp
+  (ns) not AMQP header (s); single-instance job; at-least-once delivery.
+- Go client: cgo static lib; one shared client per process; Submit-style calls
+  accept slices → batch naturally.
 
-Result struct is `{Timestamp uint64, Status uint32, Reserved uint32}`, indexed
-1:1 with the request slice.
+## Go constants quick reference (bindings.go v0.17.9)
 
-## Go client surface (what we wrap)
-
-- `Client` interface: `CreateAccounts`, `CreateTransfers`, `LookupAccounts`,
-  `LookupTransfers`, `GetAccountTransfers`, `GetAccountBalances`,
-  `QueryAccounts`, `QueryTransfers`, `Nop`, `Close`.
-- `NewClient(clusterID Uint128, addresses []string)`.
-- `Uint128` is `__uint128_t` (no named High/Low fields); build via
-  `ToUint128`, `BytesToUint128`, `HexStringToUint128`, `ID()`.
-- Requires cgo + gcc to build (links static `libtb_client_*.a`).
-
-## Not re-verified this round (existing plan knowledge, see plan.md §3)
-
-CDC (`tigerbeetle amqp`), query_filter time-range pagination, multi-replica
-ops. Already captured in plan.md and the earlier CDC-docs read.
+```go
+tb.AccountFlags{DebitsMustNotExceedCredits: true}.ToUint16()
+tb.TransferFlags{PostPendingTransfer: true}.ToUint16()
+tb.TransferCreated        // 0xFFFFFFFF success
+tb.TransferExceedsCredits // 54 — invariant would break (our "locked" signal!)
+tb.TransferExceedsDebits  // 55
+tb.TransferPendingTransferExpired // 35
+tb.Uint128 via tb.ToUint128(uint64) / tb.BytesToUint128([16]byte)
+// t.ID.Bytes() returns [16]byte (array, not slice)
+```
