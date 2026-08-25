@@ -1,0 +1,18 @@
+# Binaries
+/bin/
+/server
+/bot
+
+# Go
+*.test
+*.out
+
+# Local data
+/data/
+*.tigerbeetle
+
+# Env & editor
+.env
+.idea/
+.vscode/
+*.swp
