@@ -15,6 +15,7 @@
 
   <main id="grid"
         class="grid"
+        style="--cols: {{.Cols}}"
         data-sse-connect="/sse"
         data-on-click="claimClick($event)">{{range .Cells}}{{.}}{{end}}</main>
 

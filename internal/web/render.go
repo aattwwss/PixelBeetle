@@ -73,13 +73,20 @@ func newTemplateRenderer() (*templateRenderer, error) {
 
 func (tr *templateRenderer) renderIndex(w io.Writer, svc *game.Service) error {
 	snap := svc.Snapshot()
-	cells := make([]template.HTML, 0, len(snap))
-	for k, p := range snap { // TODO(plan): deterministic order once CDC catch-up lands
-		x, y := uint32(k>>32), uint32(k&0xffffffff)
-		cells = append(cells, template.HTML(canvas.CellHTML(x, y, "painted", p.Color))) // CellHTML is trusted markup built from ints only
+	gw, gh := svc.Grid()
+	cells := make([]template.HTML, 0, int(gw)*int(gh))
+	for y := uint32(0); y < gh; y++ {
+		for x := uint32(0); x < gw; x++ {
+			if p, ok := snap[uint64(x)<<32|uint64(y)]; ok { // CellHTML is trusted markup built from ints only
+				cells = append(cells, template.HTML(canvas.CellHTML(x, y, "painted", p.Color)))
+			} else {
+				cells = append(cells, template.HTML(canvas.CellHTML(x, y, "", 0)))
+			}
+		}
 	}
 	return tr.index.ExecuteTemplate(w, "index.html", map[string]any{
 		"Cells": cells,
+		"Cols":  gw,
 	})
 }
 

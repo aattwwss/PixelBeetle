@@ -164,6 +164,9 @@ func (s *Service) Snapshot() map[uint64]Pixel {
 	return out
 }
 
+// Grid returns the canvas dimensions.
+func (s *Service) Grid() (uint32, uint32) { return s.gridW, s.gridH }
+
 // ReapExpired drops stale in-memory locks. TigerBeetle auto-expires the
 // underlying pending transfers (emitting two_phase_expired over CDC), so this
 // only unblocks UI claiming — no DB work required.
