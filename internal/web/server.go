@@ -4,6 +4,7 @@ package web
 
 import (
 	"errors"
+	"io/fs"
 	"log/slog"
 	"net/http"
 
@@ -32,7 +33,13 @@ func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /{$}", s.handleIndex)
-	mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.FS(staticFS))))
+	// embed.FS root is the package dir, so files live at "static/..." inside it;
+	// sub to that dir so /static/<file> maps directly.
+	staticRoot, err := fs.Sub(staticFS, "static")
+	if err != nil {
+		panic("web: embed static/ missing: " + err.Error())
+	}
+	mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.FS(staticRoot))))
 	mux.HandleFunc("GET /sse", s.handleSSE)
 	mux.HandleFunc("POST /claim", s.withPlayer(s.handleClaim))
 	mux.HandleFunc("POST /confirm", s.withPlayer(s.handleConfirm))
