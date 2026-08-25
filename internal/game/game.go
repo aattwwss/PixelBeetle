@@ -42,30 +42,32 @@ type ClaimMeta struct {
 }
 
 type Service struct {
-	mu      sync.Mutex
-	gridW   uint32
-	gridH   uint32
-	pixels  map[uint64]Pixel // key = pack(x,y)
-	locks   map[uint64]lock
-	claims  map[[16]byte]ClaimMeta // claim transfer id -> meta, until resolved
-	created map[uint64]struct{}    // pixel accounts already ensured in TB
-	hub     *hub.Hub
-	tb      *tbclient.Client
-	log     *slog.Logger
-	sysOnce sync.Once
+	mu       sync.Mutex
+	gridW    uint32
+	gridH    uint32
+	pixels   map[uint64]Pixel // key = pack(x,y)
+	locks    map[uint64]lock
+	claims   map[[16]byte]ClaimMeta // claim transfer id -> meta, until resolved
+	byPlayer map[uuid.UUID][16]byte // player -> their single active claim
+	created  map[uint64]struct{}    // pixel accounts already ensured in TB
+	hub      *hub.Hub
+	tb       *tbclient.Client
+	log      *slog.Logger
+	sysOnce  sync.Once
 }
 
 func New(w, h uint32, tb *tbclient.Client, h2 *hub.Hub, log *slog.Logger) *Service {
 	return &Service{
-		gridW:   w,
-		gridH:   h,
-		pixels:  make(map[uint64]Pixel),
-		locks:   make(map[uint64]lock),
-		claims:  make(map[[16]byte]ClaimMeta),
-		created: make(map[uint64]struct{}),
-		hub:     h2,
-		tb:      tb,
-		log:     log,
+		gridW:    w,
+		gridH:    h,
+		pixels:   make(map[uint64]Pixel),
+		locks:    make(map[uint64]lock),
+		claims:   make(map[[16]byte]ClaimMeta),
+		byPlayer: make(map[uuid.UUID][16]byte),
+		created:  make(map[uint64]struct{}),
+		hub:      h2,
+		tb:       tb,
+		log:      log,
 	}
 }
 
@@ -73,6 +75,8 @@ func pack(x, y uint32) uint64 { return uint64(x)<<32 | uint64(y) }
 
 // Claim attempts to lock (x,y) for player. Durable state lands in TigerBeetle
 // as a pending transfer; the lock table only gates concurrent attempts.
+// A player holds at most ONE active claim: claiming again voids the previous
+// pending transfer first (server-enforced invariant, clients can't forget).
 func (s *Service) Claim(player uuid.UUID, x, y uint32, color uint8) ([16]byte, error) {
 	s.ensureSystemPool()
 	s.ensurePixel(x, y)
@@ -83,22 +87,60 @@ func (s *Service) Claim(player uuid.UUID, x, y uint32, color uint8) ([16]byte, e
 		s.mu.Unlock()
 		return [16]byte{}, ErrLockedByOther
 	}
+	// Supersede any prior claim held by this player.
+	var old ClaimMeta
+	hadOld := false
+	if oldID, ok := s.byPlayer[player]; ok {
+		if m, ok := s.claims[oldID]; ok {
+			old = m
+			hadOld = true
+			s.vacate(oldID, pack(old.X, old.Y))
+		}
+	}
 	t := tbclient.NewClaim(x, y, color, player)
 	id := t.ID.Bytes()
 	s.locks[key] = lock{player: player, expires: time.Now().Add(time.Duration(tbclient.ClaimTimeoutSeconds) * time.Second)}
 	s.claims[id] = ClaimMeta{X: x, Y: y, Color: color, Player: player, Transfer: t.ID.Bytes()}
+	s.byPlayer[player] = id
 	s.mu.Unlock()
 
+	// Roll back locally if the new pending never reached TB.
 	if err := s.tb.Submit(t); err != nil {
 		s.mu.Lock()
 		delete(s.locks, key)
 		delete(s.claims, id)
+		delete(s.byPlayer, player)
 		s.mu.Unlock()
 		return [16]byte{}, err
 	}
 
+	// Void the superseded pending transfer. If this fails the transfer still
+	// self-expires in TB after its timeout; the UI is already consistent.
+	if hadOld {
+		if err := s.tb.Submit(tbclient.BuildVoid(u128(old.Transfer), old.Color)); err != nil {
+			s.log.Warn("failed to void superseded claim", "err", err)
+		} else {
+			s.hub.PixelUnlocked(old.X, old.Y)
+		}
+	}
+
 	s.hub.PixelLocked(x, y)
 	return id, nil
+}
+
+// vacate removes a claim and its lock + player index. Caller holds s.mu.
+func (s *Service) vacate(claimID [16]byte, key uint64) {
+	m, ok := s.claims[claimID]
+	if !ok {
+		return
+	}
+	if cur, ok := s.byPlayer[m.Player]; ok && cur == claimID {
+		delete(s.byPlayer, m.Player)
+	}
+	delete(s.claims, claimID)
+	if l, ok := s.locks[key]; ok && l.player == m.Player {
+		delete(s.locks, key)
+	}
 }
 
 // Confirm posts the pending transfer, painting the pixel permanently.
@@ -116,8 +158,7 @@ func (s *Service) Confirm(player uuid.UUID, claimID [16]byte) error {
 	key := pack(meta.X, meta.Y)
 	prev := s.pixels[key]
 	s.pixels[key] = Pixel{Color: meta.Color, Version: prev.Version + 1}
-	delete(s.claims, claimID)
-	delete(s.locks, key)
+	s.vacate(claimID, key)
 	s.mu.Unlock()
 
 	s.hub.PixelPainted(meta.X, meta.Y, meta.Color)
@@ -135,8 +176,7 @@ func (s *Service) Cancel(player uuid.UUID, claimID [16]byte) error {
 		return err
 	}
 	s.mu.Lock()
-	delete(s.locks, pack(meta.X, meta.Y))
-	delete(s.claims, claimID)
+	s.vacate(claimID, pack(meta.X, meta.Y))
 	s.mu.Unlock()
 	s.hub.PixelUnlocked(meta.X, meta.Y)
 	return nil
@@ -176,6 +216,13 @@ func (s *Service) ReapExpired() {
 	s.mu.Lock()
 	for k, l := range s.locks {
 		if now.After(l.expires) {
+			// The pending transfer self-expires in TB; drop the local claim so
+			// a late confirm gets a clean 409 instead of posting a dead pending.
+			if id, ok := s.byPlayer[l.player]; ok {
+				if m, ok := s.claims[id]; ok && pack(m.X, m.Y) == k {
+					s.vacate(id, k)
+				}
+			}
 			delete(s.locks, k)
 			n++
 		}
