@@ -7,6 +7,80 @@ in gameplay that makes those features *visible*.
 
 ---
 
+## 0. Progress tracker
+
+_Updated: 2026-08-26._ Repo: `github.com/aattwwss/PixelBeetle`. Run instructions:
+`scripts/dev-cluster.sh start` (TB ×3 native) then `scripts/run-server.sh start`
+(see README).
+
+### Done ✅
+
+- **Project scaffold**: Go module, `cmd/server` + `cmd/bot`, packages
+  `internal/{tbclient,game,hub,web,canvas,bot,replay}`; builds clean (`go vet`).
+- **Infra (dev)**: native TigerBeetle v0.17.9 cluster, 3 replicas on
+  `127.0.0.1:3000-3002` via `scripts/dev-cluster.sh` (start/stop/status/format).
+  *Deviation from §6*: docs explicitly discourage running TB in Docker; image
+  lives on ghcr.io (not Docker Hub) and multi-replica compose requires host
+  networking (TB validates replica addresses, rejects DNS names). The old
+  docker-compose.yml is stale — see TODO below.
+- **Core server**: full two-phase claim flow working end-to-end against the live
+  cluster:
+  - claim → pending transfer (UUIDv7 id, amount=1, code=`TransferCodeClaim|color`,
+    user_data_128=player, timeout=3s) + in-memory lock;
+  - confirm → post leg (**must set `PendingID`; code must repeat the pending's
+    exactly**) → cache updated, `PixelPainted` broadcast;
+  - cancel → void leg → pixel freed;
+  - abandon → lock expires from memory after ~3s, TB auto-expires the pending;
+  - contested claim returns HTTP 409.
+- **Web UI**: SSR grid (html/template) + DataStar SSE hub; delegated click
+  handler; painted-cell markup shared between SSR and SSE patches
+  (`internal/canvas`). Fixed html/template escaping of cell HTML.
+- **Load generator skeleton**: `cmd/bot` with api/direct modes, token-bucket ramp,
+  hotspot mode, latency histogram (p50/p99), ~10% deliberate abandonment.
+- **Live-verified demo paths**: repaint by another player, reclaim after cancel,
+  reclaim after expiry.
+
+### Known gaps 🚧
+
+- **Cold start**: pixel cache is process-local — restarting the server shows an
+  empty canvas even though TB holds all state. Fix = build-order step 5
+  (boot-time catch-up). Interim workaround: none.
+- **docker-compose.yml stale**: wrong registry (`tigerbeetle/tigerbeetle` on
+  Docker Hub no longer exists → use `ghcr.io/tigerbeetle/tigerbeetle`),
+  service-name addressing won't pass TB validation (host networking needed),
+  and this machine runs podman(-compose) where `make up` hangs. Either rework
+  for ghcr + host networking or deprecate compose in favor of the native
+  scripts + a single RabbitMQ container.
+- **No batching layer**: every claim is a size-1 `create_transfers` batch.
+  reference.md evidence: batched ≈250k writes/s vs ≈105/s unbatched. Needed
+  before any serious load numbers (chained-batch collector inside tbclient;
+  also fold first-touch `EnsureAccounts` into it).
+- **CDC/replay**: `internal/replay` is a typed stub (`ErrNotImplemented`);
+  RabbitMQ not provisioned yet.
+
+### Build order status (§7)
+
+| # | Step | Status |
+|---|------|--------|
+| 1 | Infra: TB ×3 (+ RabbitMQ) | ✅ TB native scripts; 🚧 RabbitMQ + CDC job pending; compose stale |
+| 2 | Core server: accounts, pending→post/void, locks, cache | ✅ done, live-tested |
+| 3 | Web UI: SSR grid + DataStar SSE | ✅ basic loop works; polish (palette picker, countdown HUD) open |
+| 4 | CDC consumer + replay service + slider UI | ⬜ not started |
+| 5 | Cache recovery (snapshot + catch-up on boot) | ⬜ not started — blocks restart demos |
+| 6 | Load gen + live dashboard | 🚧 bot binary exists; dashboard/metrics page not started |
+| 7 | Fault-tolerance demo script (kill replica mid-load) | ⬜ blocked on 4–6 |
+
+### Suggested next actions
+
+1. Provision RabbitMQ (single podman container is enough) + run
+   `tigerbeetle amqp` CDC job; implement the replay consumer (step 4).
+2. Boot-time cache catch-up: either consume CDC from timestamp 0 (showcases
+   CDC) or `query_filter` range scan (simpler) — decide when building step 5.
+3. Batching layer in `tbclient` before publishing throughput numbers.
+4. Rework-or-retire docker-compose.yml (ghcr image, host networking, RabbitMQ).
+
+---
+
 ## 1. Core model
 
 TigerBeetle is an accounting database, so we store **events (claims), not state**.
