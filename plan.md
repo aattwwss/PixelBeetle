@@ -44,26 +44,42 @@ _Updated: 2026-08-26._ Repo: `github.com/aattwwss/PixelBeetle`. Run instructions
 
 - **Cold start**: pixel cache is process-local — restarting the server shows an
   empty canvas even though TB holds all state. Fix = build-order step 5
-  (boot-time catch-up). Interim workaround: none.
+  (boot-time catch-up via CDC or query_transfers). Interim workaround: none.
 - **docker-compose.yml stale**: wrong registry (`tigerbeetle/tigerbeetle` on
   Docker Hub no longer exists → use `ghcr.io/tigerbeetle/tigerbeetle`),
   service-name addressing won't pass TB validation (host networking needed),
   and this machine runs podman(-compose) where `make up` hangs. Either rework
   for ghcr + host networking or deprecate compose in favor of the native
   scripts + a single RabbitMQ container.
-- **No batching layer**: every claim is a size-1 `create_transfers` batch.
-  reference.md evidence: batched ≈250k writes/s vs ≈105/s unbatched. Needed
-  before any serious load numbers (chained-batch collector inside tbclient;
-  also fold first-touch `EnsureAccounts` into it).
 - **CDC/replay**: `internal/replay` is a typed stub (`ErrNotImplemented`);
   RabbitMQ not provisioned yet.
+
+### Core model v2: DB-enforced exclusivity (2026-08-26) ✅
+
+Rewrote the transfer model so **TigerBeetle itself rejects competing claims**
+(docs/tigerbeetle-cheatsheet.md has the full spec):
+
+1. Pixel account created with `debits_must_not_exceed_credits`, funded once
+   with exactly 1 unit (deterministic fund-transfer id ⇒ idempotent).
+2. Claim = pending debit of that unit. A second concurrent claim fails AT
+   CREATION inside TB (`exceeds_credits`) — no app lock decides the winner.
+3. Confirm = one linked batch: post leg + re-fund (atomic; unit restored).
+4. Cancel/expiry voids the pending — unit restores automatically.
+
+The in-memory lock table remains only as an instant-reject fast path and UI
+broadcast trigger; it is never the source of truth. Verified live: race → 409,
+confirm paints, repaint works, supersede/cancel/expiry all free the unit,
+bots run clean.
+
+Note: the Go client auto-batches concurrent submissions (docs), so the
+previously planned custom batching layer was dropped.
 
 ### Build order status (§7)
 
 | # | Step | Status |
 |---|------|--------|
 | 1 | Infra: TB ×3 (+ RabbitMQ) | ✅ TB native scripts; 🚧 RabbitMQ + CDC job pending; compose stale |
-| 2 | Core server: accounts, pending→post/void, locks, cache | ✅ done, live-tested |
+| 2 | Core server: accounts, pending→post/void, locks, cache | ✅ done; v2 model puts exclusivity inside TB |
 | 3 | Web UI: SSR grid + DataStar SSE | ✅ basic loop works; polish (palette picker, countdown HUD) open |
 | 4 | CDC consumer + replay service + slider UI | ⬜ not started |
 | 5 | Cache recovery (snapshot + catch-up on boot) | ⬜ not started — blocks restart demos |
@@ -76,8 +92,9 @@ _Updated: 2026-08-26._ Repo: `github.com/aattwwss/PixelBeetle`. Run instructions
    `tigerbeetle amqp` CDC job; implement the replay consumer (step 4).
 2. Boot-time cache catch-up: either consume CDC from timestamp 0 (showcases
    CDC) or `query_filter` range scan (simpler) — decide when building step 5.
-3. Batching layer in `tbclient` before publishing throughput numbers.
-4. Rework-or-retire docker-compose.yml (ghcr image, host networking, RabbitMQ).
+3. Rework-or-retire docker-compose.yml (ghcr image, host networking, RabbitMQ).
+4. Measure whether client auto-batching suffices under load before adding any
+   explicit batching (see docs/tigerbeetle-cheatsheet.md).
 
 ---
 

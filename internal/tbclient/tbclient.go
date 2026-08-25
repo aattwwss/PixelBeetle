@@ -10,7 +10,7 @@ import (
 	tb "github.com/tigerbeetle/tigerbeetle-go"
 )
 
-// Domain conventions (see plan.md §1).
+// Domain conventions (see plan.md §1 + docs/tigerbeetle-cheatsheet.md).
 const (
 	LedgerCanvas uint32 = 1 // ledger 1 == "Canvas"
 
@@ -18,13 +18,18 @@ const (
 	AccountCodePixel  uint16 = 1000
 
 	// Transfer code carries the chosen color (0–255).
-	TransferCodeClaim uint16 = 1000 // base code; color OR'd in by NewClaim
+	TransferCodeClaim  uint16 = 1000 // base code; color OR'd in by NewClaim
+	TransferCodeRefund uint16 = 1001 // re-fund leg after a posted claim
 
 	ClaimTimeoutSeconds uint32 = 3 // pending-lock window
 )
 
 // SystemPoolID is the fixed dummy debit-side account.
 var SystemPoolID = tb.ToUint128(1)
+
+// ErrPixelLocked means TigerBeetle itself rejected the claim because the
+// pixel's claimable unit is already reserved by a pending transfer.
+var ErrPixelLocked = fmt.Errorf("pixel already claimed")
 
 type Client struct {
 	tb tb.Client
@@ -59,6 +64,9 @@ func (c *Client) EnsureAccounts(pixelIDs ...tb.Uint128) error {
 			ID:     id,
 			Ledger: LedgerCanvas,
 			Code:   AccountCodePixel,
+			Flags: tb.AccountFlags{ // the exclusivity invariant lives HERE
+				DebitsMustNotExceedCredits: true,
+			}.ToUint16(),
 		})
 	}
 	results, err := c.tb.CreateAccounts(accounts)
@@ -67,9 +75,42 @@ func (c *Client) EnsureAccounts(pixelIDs ...tb.Uint128) error {
 	}
 	for _, r := range results {
 		if r.Status != tb.AccountCreated && r.Status != tb.AccountExists {
-			// NOTE: verify exact index encoding against a live cluster;
-			// Reserved likely carries the failing batch index.
-			return fmt.Errorf("tbclient: create_accounts failed: status=%d reserved=%d", r.Status, r.Reserved)
+			return fmt.Errorf("tbclient: create_accounts failed: status=%s", r.Status)
+		}
+	}
+	return nil
+}
+
+// FundID derives the deterministic fund-transfer id for a pixel. Using a
+// stable id makes funding idempotent across server restarts (exists == ok).
+func FundID(x, y uint32) tb.Uint128 {
+	var b [16]byte
+	key := uint64(x)<<32 | uint64(y)
+	b[0] = 0xF0 // marker byte: distinguishes fund ids from UUIDv7 claim ids
+	for i := 0; i < 8; i++ {
+		b[8+i] = byte(key >> (8 * (7 - i)))
+	}
+	return tb.BytesToUint128(b)
+}
+
+// Fund credits the pixel account with its single spendable unit. Idempotent:
+// re-submitting returns TransferExists and is treated as success.
+func (c *Client) Fund(x, y uint32) error {
+	t := tb.Transfer{
+		ID:              FundID(x, y),
+		DebitAccountID:  SystemPoolID,
+		CreditAccountID: PixelID(x, y),
+		Amount:          tb.ToUint128(1),
+		Code:            TransferCodeRefund,
+		Ledger:          LedgerCanvas,
+	}
+	results, err := c.tb.CreateTransfers([]tb.Transfer{t})
+	if err != nil {
+		return fmt.Errorf("tbclient: fund: %w", err)
+	}
+	for _, r := range results {
+		if r.Status != tb.TransferCreated && r.Status != tb.TransferExists {
+			return fmt.Errorf("tbclient: fund failed: status=%s", r.Status)
 		}
 	}
 	return nil
@@ -78,16 +119,17 @@ func (c *Client) EnsureAccounts(pixelIDs ...tb.Uint128) error {
 // NewClaim builds the pending transfer that locks a pixel for a player.
 //
 //	id            = fresh UUIDv7 (idempotent retries, LSM-friendly ordering)
-//	debit         = system pool (keeps double-entry balanced)
-//	credit        = pixel account (balance becomes the pixel version counter)
+//	debit         = PIXEL account — debits_must_not_exceed_credits makes a
+//	                concurrent second claim fail AT CREATION with exceeds_credits
+//	credit        = system pool
 //	code          = the color
 //	user_data_128 = the player id
 func NewClaim(x, y uint32, color uint8, player uuid.UUID) tb.Transfer {
 	flags := tb.TransferFlags{Pending: true}
 	return tb.Transfer{
 		ID:              UUIDToUint128(uuid.Must(uuid.NewV7())),
-		DebitAccountID:  SystemPoolID,
-		CreditAccountID: PixelID(x, y),
+		DebitAccountID:  PixelID(x, y),
+		CreditAccountID: SystemPoolID,
 		Amount:          tb.ToUint128(1),
 		UserData128:     tb.BytesToUint128(player),
 		Code:            TransferCodeClaim | uint16(color),
@@ -97,37 +139,65 @@ func NewClaim(x, y uint32, color uint8, player uuid.UUID) tb.Transfer {
 	}
 }
 
-// BuildPost finalizes a pending claim (two-phase commit: commit leg).
-// The commit/rollback leg references the pending transfer via PendingID and
-// must repeat the pending transfer's code exactly.
-func BuildPost(claimID tb.Uint128, color uint8) tb.Transfer {
+// BuildPost builds the post leg of a confirm. Resolution legs may omit
+// debit/credit/ledger/code entirely (zero) — TB copies them from the pending.
+func BuildPost(claimID tb.Uint128) tb.Transfer {
 	flags := tb.TransferFlags{PostPendingTransfer: true}
 	return tb.Transfer{
 		ID:        UUIDToUint128(uuid.Must(uuid.NewV7())),
 		PendingID: claimID,
-		Code:      TransferCodeClaim | uint16(color),
 		Flags:     flags.ToUint16(),
 	}
 }
 
 // BuildVoid discards a pending claim early (two-phase commit: rollback leg).
-func BuildVoid(claimID tb.Uint128, color uint8) tb.Transfer {
+func BuildVoid(claimID tb.Uint128) tb.Transfer {
 	flags := tb.TransferFlags{VoidPendingTransfer: true}
 	return tb.Transfer{
 		ID:        UUIDToUint128(uuid.Must(uuid.NewV7())),
 		PendingID: claimID,
-		Code:      TransferCodeClaim | uint16(color),
 		Flags:     flags.ToUint16(),
 	}
 }
 
+// BuildConfirm is the atomic commit path: post the pending AND re-fund the
+// pixel with its claimable unit in one linked batch. If either fails, both
+// roll back — the pixel can never lose or double-gain a unit.
+func BuildConfirm(claimID tb.Uint128, x, y uint32) []tb.Transfer {
+	post := BuildPost(claimID)
+	post.Flags = tb.TransferFlags{PostPendingTransfer: true, Linked: true}.ToUint16()
+	refund := tb.Transfer{ // plain posted transfer: put the unit back
+		ID:              UUIDToUint128(uuid.Must(uuid.NewV7())),
+		DebitAccountID:  SystemPoolID,
+		CreditAccountID: PixelID(x, y),
+		Amount:          tb.ToUint128(1),
+		Code:            TransferCodeRefund,
+		Ledger:          LedgerCanvas,
+	}
+	return []tb.Transfer{post, refund}
+}
+
+// Submit sends one transfer; used by direct-mode bots and simple paths.
+// Accepts created / exists / already-resolved as success.
 func (c *Client) Submit(t tb.Transfer) error {
-	results, err := c.tb.CreateTransfers([]tb.Transfer{t})
+	return c.SubmitBatch([]tb.Transfer{t})
+}
+
+// SubmitBatch sends multiple transfers atomically as one request and maps
+// result statuses to domain errors.
+func (c *Client) SubmitBatch(transfers []tb.Transfer) error {
+	results, err := c.tb.CreateTransfers(transfers)
 	if err != nil {
 		return fmt.Errorf("tbclient: create_transfers: %w", err)
 	}
 	for _, r := range results {
-		if r.Status != tb.TransferCreated && r.Status != tb.TransferPendingTransferAlreadyPosted {
+		switch r.Status {
+		case tb.TransferCreated, tb.TransferExists,
+			tb.TransferPendingTransferAlreadyPosted, tb.TransferPendingTransferAlreadyVoided:
+			continue // idempotent successes
+		case tb.TransferExceedsCredits:
+			return ErrPixelLocked
+		default:
 			return fmt.Errorf("tbclient: create_transfers failed: status=%s", r.Status)
 		}
 	}

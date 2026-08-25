@@ -168,7 +168,7 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) (*Metrics, error) {
 					m.dropLatency(started)
 					continue
 				}
-				if err := resolveClaim(ctx, httpc, direct, cfg.Target, player, claimID, true); err != nil {
+				if err := resolveClaim(ctx, httpc, direct, cfg.Target, player, claimID, x, y, true); err != nil {
 					m.recordFailure(err, &m.Errors)
 					continue
 				}
@@ -267,7 +267,7 @@ func submitClaim(ctx context.Context, hc *http.Client, direct *tbclient.Client, 
 	return out.ClaimID, nil
 }
 
-func resolveClaim(ctx context.Context, hc *http.Client, direct *tbclient.Client, target string, player uuid.UUID, claimID string, confirm bool) error {
+func resolveClaim(ctx context.Context, hc *http.Client, direct *tbclient.Client, target string, player uuid.UUID, claimID string, x, y uint32, confirm bool) error {
 	if direct != nil {
 		_ = player
 		raw, err := hex.DecodeString(claimID)
@@ -276,7 +276,10 @@ func resolveClaim(ctx context.Context, hc *http.Client, direct *tbclient.Client,
 		}
 		var id [16]byte
 		copy(id[:], raw)
-		return direct.Submit(tbclient.BuildPost(tb.BytesToUint128(id), 0)) // color 0: pending used same code|0
+		if confirm { // post + re-fund, same atomic batch the server uses
+			return direct.SubmitBatch(tbclient.BuildConfirm(tb.BytesToUint128(id), x, y))
+		}
+		return direct.Submit(tbclient.BuildVoid(tb.BytesToUint128(id)))
 	}
 	action := "/cancel"
 	if confirm {

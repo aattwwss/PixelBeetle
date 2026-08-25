@@ -104,20 +104,25 @@ func (s *Service) Claim(player uuid.UUID, x, y uint32, color uint8) ([16]byte, e
 	s.byPlayer[player] = id
 	s.mu.Unlock()
 
-	// Roll back locally if the new pending never reached TB.
+	// TigerBeetle is the source of truth: if another player's pending holds
+	// the pixel's unit, THIS submit fails with exceeds_credits — no app-level
+	// lock decides the winner.
 	if err := s.tb.Submit(t); err != nil {
 		s.mu.Lock()
 		delete(s.locks, key)
 		delete(s.claims, id)
 		delete(s.byPlayer, player)
 		s.mu.Unlock()
+		if errors.Is(err, tbclient.ErrPixelLocked) {
+			return [16]byte{}, ErrLockedByOther
+		}
 		return [16]byte{}, err
 	}
 
 	// Void the superseded pending transfer. If this fails the transfer still
 	// self-expires in TB after its timeout; the UI is already consistent.
 	if hadOld {
-		if err := s.tb.Submit(tbclient.BuildVoid(u128(old.Transfer), old.Color)); err != nil {
+		if err := s.tb.Submit(tbclient.BuildVoid(u128(old.Transfer))); err != nil {
 			s.log.Warn("failed to void superseded claim", "err", err)
 		} else {
 			s.hub.PixelUnlocked(old.X, old.Y)
@@ -149,8 +154,8 @@ func (s *Service) Confirm(player uuid.UUID, claimID [16]byte) error {
 	if err != nil {
 		return err
 	}
-	post := tbclient.BuildPost(u128(meta.Transfer), meta.Color)
-	if err := s.tb.Submit(post); err != nil {
+	confirm := tbclient.BuildConfirm(u128(meta.Transfer), meta.X, meta.Y)
+	if err := s.tb.SubmitBatch(confirm); err != nil {
 		return err
 	}
 
@@ -171,7 +176,7 @@ func (s *Service) Cancel(player uuid.UUID, claimID [16]byte) error {
 	if err != nil {
 		return err
 	}
-	void := tbclient.BuildVoid(u128(meta.Transfer), meta.Color)
+	void := tbclient.BuildVoid(u128(meta.Transfer))
 	if err := s.tb.Submit(void); err != nil {
 		return err
 	}
@@ -244,6 +249,9 @@ func (s *Service) ensureSystemPool() {
 // ensurePixel creates the pixel's account once per process lifetime.
 // TODO(plan §4): fold into the batching layer so first-touch claims ride
 // along with concurrent batches instead of paying their own round trip.
+// ensurePixel creates the pixel's account (with the exclusivity flag) and
+// funds its single claimable unit. Both steps are idempotent across restarts
+// (exists == ok).
 func (s *Service) ensurePixel(x, y uint32) {
 	key := pack(x, y)
 	s.mu.Lock()
@@ -254,6 +262,10 @@ func (s *Service) ensurePixel(x, y uint32) {
 	}
 	if err := s.tb.EnsureAccounts(tbclient.PixelID(x, y)); err != nil {
 		s.log.Error("failed to create pixel account", "x", x, "y", y, "err", err)
+		return
+	}
+	if err := s.tb.Fund(x, y); err != nil {
+		s.log.Error("failed to fund pixel", "x", x, "y", y, "err", err)
 		return
 	}
 	s.mu.Lock()
