@@ -16,7 +16,7 @@
   <main id="grid"
         class="grid"
         style="--cols: {{.Cols}}"
-        data-init="@get('/sse')"><!-- @get sees text/event-stream and stays connected; clicks bound natively in app.js -->{{range .Cells}}{{.}}{{end}}</main>
+        data-init="@get('/sse', {openWhenHidden: true})"><!-- @get sees text/event-stream and stays connected; clicks bound natively in app.js -->{{range .Cells}}{{.}}{{end}}</main>
 
   <script type="module" src="/static/datastar.js"></script>
   <script src="/static/app.js"></script>
