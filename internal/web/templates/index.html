@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Canvas Clash</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header>
+    <h1>Canvas Clash</h1>
+    <p class="tagline">every pixel is a TigerBeetle transfer</p>
+    <div id="hud" data-signals="{claimId: null, locked: false}"></div>
+  </header>
+
+  <main id="grid"
+        class="grid"
+        data-sse-connect="/sse"
+        data-on-click="claimClick($event)">{{range .Cells}}{{.}}{{end}}</main>
+
+  <script src="/static/datastar.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

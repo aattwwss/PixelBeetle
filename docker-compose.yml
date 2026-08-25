@@ -1,0 +1,82 @@
+name: pixelbeetle
+
+services:
+  rabbitmq:
+    image: rabbitmq:3-management
+    ports:
+      - "5672:5672"    # AMQP
+      - "15672:15672"  # management UI (guest/guest)
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  # CDC publishes to a pre-existing exchange — declare it before starting the job.
+  rabbitmq-init:
+    image: curlimages/curl
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    command:
+      - -u
+      - guest:guest
+      - -X
+      - PUT
+      - http://rabbitmq:15672/api/exchanges/%2F/tigerbeetle
+      - -H
+      - content-type:application/json
+      - -d
+      - '{"type":"fanout","auto_delete":false,"durable":true}'
+
+  tigerbeetle-0:
+    image: tigerbeetle/tigerbeetle:0.17.9
+    command: sh -c "test -f /data/dev_0.tigerbeetle || ./tigerbeetle format --cluster=0 --replica=0 --replica-count=3 /data/dev_0.tigerbeetle; exec ./tigerbeetle start --addresses=0.0.0.0:3000 /data/dev_0.tigerbeetle"
+    ports:
+      - "3000:3000"
+    volumes:
+      - tb0:/data
+    healthcheck:
+      test: ["CMD-SHELL", "./tigerbeetle start --addresses=tigerbeetle-1:3000,tigerbeetle-2:3000 /dev/null || true"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      disabled: true # v1 scaffold: rely on client connect errors instead
+
+  tigerbeetle-1:
+    image: tigerbeetle/tigerbeetle:0.17.9
+    command: sh -c "test -f /data/dev_1.tigerbeetle || ./tigerbeetle format --cluster=0 --replica=1 --replica-count=3 /data/dev_1.tigerbeetle; exec ./tigerbeetle start --addresses=0.0.0.0:3000 /data/dev_1.tigerbeetle"
+    ports:
+      - "3001:3000"
+    volumes:
+      - tb1:/data
+
+  tigerbeetle-2:
+    image: tigerbeetle/tigerbeetle:0.17.9
+    command: sh -c "test -f /data/dev_2.tigerbeetle || ./tigerbeetle format --cluster=0 --replica=2 --replica-count=3 /data/dev_2.tigerbeetle; exec ./tigerbeetle start --addresses=0.0.0.0:3000 /data/dev_2.tigerbeetle"
+    ports:
+      - "3002:3000"
+    volumes:
+      - tb2:/data
+
+  cdc:
+    image: tigerbeetle/tigerbeetle:0.17.9
+    depends_on:
+      rabbitmq-init:
+        condition: service_completed_successfully
+    command:
+      - ./tigerbeetle
+      - amqp
+      - --addresses=tigerbeetle-0:3000,tigerbeetle-1:3000,tigerbeetle-2:3000
+      - --cluster=0
+      - --host=rabbitmq
+      - --vhost=/
+      - --user=guest
+      - --password=guest
+      - --publish-exchange=tigerbeetle
+    restart: unless-stopped # single-instance job; monitor & restart per docs
+
+volumes:
+  tb0:
+  tb1:
+  tb2:

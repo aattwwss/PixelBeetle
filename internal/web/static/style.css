@@ -1,0 +1,31 @@
+:root { --cell: 14px; }
+* { box-sizing: border-box; }
+body { margin: 0; font-family: system-ui, sans-serif; background: #111; color: #eee; }
+
+header { padding: .5rem 1rem; display: flex; align-items: baseline; gap: 1rem; flex-wrap: wrap; }
+h1 { font-size: 1.2rem; margin: 0; }
+.tagline { color: #888; font-size: .8rem; margin: 0; }
+#hud button { margin-left: .5rem; cursor: pointer; }
+#hud .countdown { font-size: .8rem; color: #ffd600; }
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(var(--cols), var(--cell));
+  gap: 1px;
+  padding: 8px;
+  user-select: none;
+}
+
+.cell {
+  width: var(--cell);
+  height: var(--cell);
+  background: #1c1c1c;
+  cursor: crosshair;
+}
+.cell.painted { cursor: default; }
+.cell.locked { outline: 2px solid #ffd600; outline-offset: -2px; animation: pulse .6s infinite alternate; }
+
+@keyframes pulse {
+  from { filter: brightness(.7); }
+  to   { filter: brightness(1.3); }
+}

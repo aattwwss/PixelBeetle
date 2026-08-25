@@ -14,8 +14,6 @@ import (
 const (
 	LedgerCanvas uint32 = 1 // ledger 1 == "Canvas"
 
-	SystemPoolID = tigerbeetle.Uint128{Low: 1} // fixed dummy debit-side account
-
 	AccountCodeSystem uint16 = 999
 	AccountCodePixel  uint16 = 1000
 
@@ -24,6 +22,9 @@ const (
 
 	ClaimTimeoutSeconds uint32 = 3 // pending-lock window
 )
+
+// SystemPoolID is the fixed dummy debit-side account.
+var SystemPoolID = tb.ToUint128(1)
 
 type Client struct {
 	tb tb.Client

@@ -81,9 +81,8 @@ func (s *Service) Claim(player uuid.UUID, x, y uint32, color uint8) ([16]byte, e
 		return [16]byte{}, ErrLockedByOther
 	}
 	t := tbclient.NewClaim(x, y, color, player)
-	var id [16]byte
-	copy(id[:], t.ID.Bytes())
-	s.locks[key] = lock{player: player, expires: time.Now().Add(tbclient.ClaimTimeoutSeconds * time.Second)}
+	id := t.ID.Bytes()
+	s.locks[key] = lock{player: player, expires: time.Now().Add(time.Duration(tbclient.ClaimTimeoutSeconds) * time.Second)}
 	s.claims[id] = ClaimMeta{X: x, Y: y, Color: color, Player: player, Transfer: t.ID.Bytes()}
 	s.mu.Unlock()
 
