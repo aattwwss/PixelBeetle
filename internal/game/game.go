@@ -48,6 +48,7 @@ type Service struct {
 	pixels  map[uint64]Pixel // key = pack(x,y)
 	locks   map[uint64]lock
 	claims  map[[16]byte]ClaimMeta // claim transfer id -> meta, until resolved
+	created map[uint64]struct{}    // pixel accounts already ensured in TB
 	hub     *hub.Hub
 	tb      *tbclient.Client
 	log     *slog.Logger
@@ -56,14 +57,15 @@ type Service struct {
 
 func New(w, h uint32, tb *tbclient.Client, h2 *hub.Hub, log *slog.Logger) *Service {
 	return &Service{
-		gridW:  w,
-		gridH:  h,
-		pixels: make(map[uint64]Pixel),
-		locks:  make(map[uint64]lock),
-		claims: make(map[[16]byte]ClaimMeta),
-		hub:    h2,
-		tb:     tb,
-		log:    log,
+		gridW:   w,
+		gridH:   h,
+		pixels:  make(map[uint64]Pixel),
+		locks:   make(map[uint64]lock),
+		claims:  make(map[[16]byte]ClaimMeta),
+		created: make(map[uint64]struct{}),
+		hub:     h2,
+		tb:      tb,
+		log:     log,
 	}
 }
 
@@ -73,6 +75,7 @@ func pack(x, y uint32) uint64 { return uint64(x)<<32 | uint64(y) }
 // as a pending transfer; the lock table only gates concurrent attempts.
 func (s *Service) Claim(player uuid.UUID, x, y uint32, color uint8) ([16]byte, error) {
 	s.ensureSystemPool()
+	s.ensurePixel(x, y)
 
 	key := pack(x, y)
 	s.mu.Lock()
@@ -104,7 +107,7 @@ func (s *Service) Confirm(player uuid.UUID, claimID [16]byte) error {
 	if err != nil {
 		return err
 	}
-	post := tbclient.BuildPost(u128(meta.Transfer))
+	post := tbclient.BuildPost(u128(meta.Transfer), meta.Color)
 	if err := s.tb.Submit(post); err != nil {
 		return err
 	}
@@ -127,7 +130,7 @@ func (s *Service) Cancel(player uuid.UUID, claimID [16]byte) error {
 	if err != nil {
 		return err
 	}
-	void := tbclient.BuildVoid(u128(meta.Transfer))
+	void := tbclient.BuildVoid(u128(meta.Transfer), meta.Color)
 	if err := s.tb.Submit(void); err != nil {
 		return err
 	}
@@ -186,6 +189,26 @@ func (s *Service) ensureSystemPool() {
 			s.log.Error("failed to create system pool", "err", err)
 		}
 	})
+}
+
+// ensurePixel creates the pixel's account once per process lifetime.
+// TODO(plan §4): fold into the batching layer so first-touch claims ride
+// along with concurrent batches instead of paying their own round trip.
+func (s *Service) ensurePixel(x, y uint32) {
+	key := pack(x, y)
+	s.mu.Lock()
+	_, ok := s.created[key]
+	s.mu.Unlock()
+	if ok {
+		return
+	}
+	if err := s.tb.EnsureAccounts(tbclient.PixelID(x, y)); err != nil {
+		s.log.Error("failed to create pixel account", "x", x, "y", y, "err", err)
+		return
+	}
+	s.mu.Lock()
+	s.created[key] = struct{}{}
+	s.mu.Unlock()
 }
 
 func (s *Service) Describe() string {

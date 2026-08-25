@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"html/template"
 	"io"
@@ -97,3 +98,7 @@ func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(v)
 }
+
+func hexEncode(b [16]byte) string { return hex.EncodeToString(b[:]) }
+
+func hexDecodeString(s string) ([]byte, error) { return hex.DecodeString(s) }

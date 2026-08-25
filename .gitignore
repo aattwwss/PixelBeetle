@@ -16,3 +16,6 @@
 .idea/
 .vscode/
 *.swp
+bin/server
+bin/bot
+data/logs/

@@ -98,22 +98,26 @@ func NewClaim(x, y uint32, color uint8, player uuid.UUID) tb.Transfer {
 }
 
 // BuildPost finalizes a pending claim (two-phase commit: commit leg).
-func BuildPost(claimID tb.Uint128) tb.Transfer {
+// The commit/rollback leg references the pending transfer via PendingID and
+// must repeat the pending transfer's code exactly.
+func BuildPost(claimID tb.Uint128, color uint8) tb.Transfer {
 	flags := tb.TransferFlags{PostPendingTransfer: true}
 	return tb.Transfer{
-		ID:    UUIDToUint128(uuid.Must(uuid.NewV7())),
-		Code:  TransferCodeClaim,
-		Flags: flags.ToUint16(),
+		ID:        UUIDToUint128(uuid.Must(uuid.NewV7())),
+		PendingID: claimID,
+		Code:      TransferCodeClaim | uint16(color),
+		Flags:     flags.ToUint16(),
 	}
 }
 
 // BuildVoid discards a pending claim early (two-phase commit: rollback leg).
-func BuildVoid(claimID tb.Uint128) tb.Transfer {
+func BuildVoid(claimID tb.Uint128, color uint8) tb.Transfer {
 	flags := tb.TransferFlags{VoidPendingTransfer: true}
 	return tb.Transfer{
-		ID:    UUIDToUint128(uuid.Must(uuid.NewV7())),
-		Code:  TransferCodeClaim,
-		Flags: flags.ToUint16(),
+		ID:        UUIDToUint128(uuid.Must(uuid.NewV7())),
+		PendingID: claimID,
+		Code:      TransferCodeClaim | uint16(color),
+		Flags:     flags.ToUint16(),
 	}
 }
 

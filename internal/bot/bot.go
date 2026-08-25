@@ -9,6 +9,7 @@ package bot
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -230,46 +231,52 @@ func (m *Metrics) LatencyReport() (p50, p99 float64) {
 
 // ---- transport adapters ----
 
-func submitClaim(ctx context.Context, hc *http.Client, direct *tbclient.Client, target string, player uuid.UUID, x, y uint32, color uint8) ([16]byte, error) {
+func submitClaim(ctx context.Context, hc *http.Client, direct *tbclient.Client, target string, player uuid.UUID, x, y uint32, color uint8) (string, error) {
 	if direct != nil { // direct mode: same claim builder, straight to TB
 		t := tbclient.NewClaim(x, y, color, player)
 		if err := direct.Submit(t); err != nil {
-			return [16]byte{}, err
+			return "", err
 		}
 		id := t.ID.Bytes()
-		return id, nil
+		return hex.EncodeToString(id[:]), nil
 	}
 
 	body, _ := json.Marshal(map[string]any{"x": x, "y": y, "color": color})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target+"/claim", bytes.NewReader(body))
 	if err != nil {
-		return [16]byte{}, err
+		return "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.AddCookie(&http.Cookie{Name: "player_id", Value: player.String()})
 	resp, err := hc.Do(req)
 	if err != nil {
-		return [16]byte{}, err
+		return "", err
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode == http.StatusConflict {
-		return [16]byte{}, fmt.Errorf("pixel locked by another player")
+		return "", fmt.Errorf("pixel locked by another player")
 	}
 	if resp.StatusCode != http.StatusOK {
-		return [16]byte{}, fmt.Errorf("claim: %d %s", resp.StatusCode, raw)
+		return "", fmt.Errorf("claim: %d %s", resp.StatusCode, raw)
 	}
-	var out struct{ ClaimID [16]byte }
+	var out struct{ ClaimID string }
 	if err := json.Unmarshal(raw, &out); err != nil {
-		return [16]byte{}, err
+		return "", err
 	}
 	return out.ClaimID, nil
 }
 
-func resolveClaim(ctx context.Context, hc *http.Client, direct *tbclient.Client, target string, player uuid.UUID, claimID [16]byte, confirm bool) error {
+func resolveClaim(ctx context.Context, hc *http.Client, direct *tbclient.Client, target string, player uuid.UUID, claimID string, confirm bool) error {
 	if direct != nil {
 		_ = player
-		return direct.Submit(tbclient.BuildPost(toTB(claimID)))
+		raw, err := hex.DecodeString(claimID)
+		if err != nil || len(raw) != 16 {
+			return fmt.Errorf("invalid claim id %q", claimID)
+		}
+		var id [16]byte
+		copy(id[:], raw)
+		return direct.Submit(tbclient.BuildPost(tb.BytesToUint128(id), 0)) // color 0: pending used same code|0
 	}
 	action := "/cancel"
 	if confirm {

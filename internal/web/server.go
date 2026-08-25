@@ -71,11 +71,11 @@ type claimRequest struct {
 }
 
 type claimResponse struct {
-	ClaimID [16]byte `json:"claimId"`
+	ClaimID string `json:"claimId"` // 32-char hex of the claim transfer id
 }
 
 type idRequest struct {
-	ClaimID [16]byte `json:"claimId"`
+	ClaimID string `json:"claimId"`
 }
 
 func (s *Server) withPlayer(next func(w http.ResponseWriter, r *http.Request, player uuid.UUID)) http.HandlerFunc {
@@ -98,8 +98,19 @@ func (s *Server) handleClaim(w http.ResponseWriter, r *http.Request, player uuid
 		s.log.Error("claim", "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 	default:
-		writeJSON(w, claimResponse{ClaimID: id})
+		writeJSON(w, claimResponse{ClaimID: hexEncode(id)})
 	}
+}
+
+// parseClaimID converts a 32-char hex id into bytes.
+func parseClaimID(hexID string) ([16]byte, error) {
+	var out [16]byte
+	b, err := hexDecodeString(hexID)
+	if err != nil || len(b) != 16 {
+		return out, errors.New("invalid claimId")
+	}
+	copy(out[:], b)
+	return out, nil
 }
 
 func (s *Server) handleConfirm(w http.ResponseWriter, r *http.Request, player uuid.UUID) {
@@ -107,7 +118,12 @@ func (s *Server) handleConfirm(w http.ResponseWriter, r *http.Request, player uu
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	if err := s.svc.Confirm(player, req.ClaimID); err != nil {
+	id, err := parseClaimID(req.ClaimID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := s.svc.Confirm(player, id); err != nil {
 		s.failClaim(w, err)
 		return
 	}
@@ -119,7 +135,12 @@ func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request, player uui
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	if err := s.svc.Cancel(player, req.ClaimID); err != nil {
+	id, err := parseClaimID(req.ClaimID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := s.svc.Cancel(player, id); err != nil {
 		s.failClaim(w, err)
 		return
 	}
