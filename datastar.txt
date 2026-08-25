@@ -1,0 +1,141 @@
+
+Datastar LogoDatastar
+CtrlK
+Guide
+Reference
+Examples
+How-Tos
+Pro
+More
+Guide
+Start building with explanations and interactive demos.
+Getting Started
+Installation
+data-*
+Patching Elements
+Reactive Signals
+Datastar Expressions
+Backend Requests
+The Tao of Datastar
+Next →
+Getting Started
+
+Datastar simplifies frontend development, allowing you to build backend-driven, interactive UIs using a hypermedia-first approach that extends and enhances HTML.
+
+Datastar provides backend reactivity like htmx and frontend reactivity like Alpine.js in a lightweight frontend framework that doesn’t require any npm packages or other dependencies. It provides two primary functions:
+
+    Modify the DOM and state by sending events from your backend.
+    Build reactivity into your frontend using standard data-* HTML attributes.
+
+Installation
+#
+
+The quickest way to use Datastar is to include it using a script tag that fetches it from a CDN.
+
+<script type="module" src="https://cdn.jsdelivr.net/gh/starfederation/datastar@v1.0.2/bundles/datastar.js"></script>
+
+Hosting the file yourself is recommended. Download the script or create your own bundle using the bundler, then include it from the appropriate path.
+
+<script type="module" src="/path/to/datastar.js"></script>
+
+To import Datastar using a package manager such as npm, Deno, or Bun, you can use an import statement.
+
+// @ts-expect-error (only required for TypeScript projects)
+import 'https://cdn.jsdelivr.net/gh/starfederation/datastar@v1.0.2/bundles/datastar.js'
+
+data-*
+#
+
+At the core of Datastar are data-* HTML attributes (hence the name). They allow you to add reactivity to your frontend and interact with your backend in a declarative way.
+
+    The Datastar VSCode extension and IntelliJ plugin provide autocompletion for all available data-* attributes.
+
+The data-on attribute can be used to attach an event listener to an element and execute an expression whenever the event is triggered. The value of the attribute is a Datastar expression in which JavaScript can be used.
+
+<button data-on:click="alert('I’m sorry, Dave. I’m afraid I can’t do that.')">
+    Open the pod bay doors, HAL.
+</button>
+
+Demo
+
+We’ll explore more data attributes in the next section of the guide.
+Patching Elements
+#
+
+With Datastar, the backend drives the frontend by patching (adding, updating and removing) HTML elements in the DOM.
+
+Datastar receives elements from the backend and manipulates the DOM using a morphing strategy (by default). Morphing ensures that only modified parts of the DOM are updated, and that only data attributes that have changed are reapplied, preserving state and improving performance.
+
+Datastar provides actions for sending requests to the backend. The @get() action sends a GET request to the provided URL using a fetch request.
+
+<button data-on:click="@get('/endpoint')">
+    Open the pod bay doors, HAL.
+</button>
+<div id="hal"></div>
+
+    Actions in Datastar are helper functions that have the syntax @actionName(). Read more about actions in the reference.
+
+If the response has a content-type of text/html, the top-level HTML elements will be morphed into the existing DOM based on the element IDs.
+
+<div id="hal">
+    I’m sorry, Dave. I’m afraid I can’t do that.
+</div>
+
+We call this a “Patch Elements” event because multiple elements can be patched into the DOM at once.
+Demo
+Waiting for an order...
+
+In the example above, the DOM must contain an element with a hal ID in order for morphing to work. Other patching strategies are available, but morph is the best and simplest choice in most scenarios.
+
+If the response has a content-type of text/event-stream, it can contain zero or more SSE events. The example above can be replicated using a datastar-patch-elements SSE event. Note that SSE events must be followed by two newline characters.
+
+event: datastar-patch-elements
+data: elements <div id="hal">
+data: elements     I’m sorry, Dave. I’m afraid I can’t do that.
+data: elements </div>
+
+Because we can send as many events as we want in a stream, and because it can be a long-lived connection, we can extend the example above to first send HAL’s response and then, after a few seconds, reset the text.
+
+event: datastar-patch-elements
+data: elements <div id="hal">
+data: elements     I’m sorry, Dave. I’m afraid I can’t do that.
+data: elements </div>
+
+event: datastar-patch-elements
+data: elements <div id="hal">
+data: elements     Waiting for an order...
+data: elements </div>
+
+Demo
+Waiting for an order...
+
+Here’s the code to generate the SSE events above using the SDKs.
+
+import (
+    "github.com/starfederation/datastar-go/datastar"
+    time
+)
+
+// Creates a new `ServerSentEventGenerator` instance.
+sse := datastar.NewSSE(w,r)
+
+// Patches elements into the DOM.
+sse.PatchElements(
+    `<div id="hal">I’m sorry, Dave. I’m afraid I can’t do that.</div>`
+)
+
+time.Sleep(1 * time.Second)
+
+sse.PatchElements(
+    `<div id="hal">Waiting for an order...</div>`
+)
+
+    In addition to your browser’s dev tools, the Datastar Inspector can be used to monitor and inspect SSE events received by Datastar.
+
+We’ll cover event streams and SSE events in more detail later in the guide, but as you can see, they are just plain text events with a special syntax, made simpler by the SDKs.
+Next →
+©
+Star Federation
+Hosted by
+Arcustech
+
