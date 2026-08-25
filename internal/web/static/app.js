@@ -7,6 +7,12 @@
 let activeClaim = null;
 let claimTimer = null;
 
+// One delegated listener for the whole grid: cells come and go via SSE patches,
+// the grid element itself never changes.
+document.getElementById('grid').addEventListener('click', (evt) => {
+  claimClick(evt);
+});
+
 async function claimClick(evt) {
   const el = evt.target.closest('.cell');
   if (!el || el.classList.contains('locked') || el.classList.contains('painted')) return;
