@@ -18,16 +18,28 @@ start() {
     # in-container rabbitmq user hits "eacces".
     DATA_DIR="$HOME/.pixelbeetle-rabbitmq"
     mkdir -p "$DATA_DIR"
-    chmod 0777 "$DATA_DIR"
-    podman run -d --name "$NAME" \
-      -v "$DATA_DIR:/var/lib/rabbitmq" \
-      -p 5672:5672 -p "$HTTP_PORT:15672" \
-      docker.io/library/rabbitmq:3-management >/dev/null
+    # Best-effort: on re-runs the dir is owned by the container's mapped uid
+    # and chmod fails with EPERM — ownership is then already correct anyway.
+    chmod 0777 "$DATA_DIR" 2>/dev/null || true
+    if ! podman run -d --name "$NAME" \
+       -v "$DATA_DIR:/var/lib/rabbitmq" \
+       -p 5672:5672 -p "$HTTP_PORT:15672" \
+       docker.io/library/rabbitmq:3-management >/dev/null; then
+      # Transient failures happen right after a rm (port release lag) — retry.
+      sleep 3
+      podman run -d --name "$NAME" \
+        -v "$DATA_DIR:/var/lib/rabbitmq" \
+        -p 5672:5672 -p "$HTTP_PORT:15672" \
+        docker.io/library/rabbitmq:3-management || { echo "podman run failed" >&2; exit 1; }
+    fi
   fi
 
   echo -n "waiting for rabbitmq"
   for _ in $(seq 1 60); do
-    if podman exec "$NAME" rabbitmq-diagnostics -q ping >/dev/null 2>&1; then
+    # The management HTTP listener comes up AFTER the Erlang node pings OK,
+    # so poll the API itself — a bare ping races it (curl error 56).
+    if curl -4 -s -o /dev/null -u guest:guest \
+         "http://127.0.0.1:$HTTP_PORT/api/overview"; then
       break
     fi
     echo -n "."
