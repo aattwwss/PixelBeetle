@@ -2,9 +2,11 @@
 
 help:
 	@echo "make up        - start dependencies: TigerBeetle cluster (db) + RabbitMQ (broker) + CDC job"
-	@echo "make serve     - run the game server in the foreground (:8080)"
+	@echo "make serve     - run the game server in the foreground (:8080, 256x256 by default)"
 	@echo "make down      - stop everything"
-	@echo "make bot RPS=100 DURATION=30s [PLAYERS=64] - run load generator"
+	@echo "make bot RPS=100 DURATION=30s [PLAYERS=64] [GRID=256x256] - run load generator"
+	@echo "make serve GRID=1000x1000     - 1M-pixel showcase (provisions 1M accounts at startup)"
+	@echo "make bot   GRID=1000x1000      - load gen against a 1M canvas (must match the server)"
 	@echo "make db-up / db-down          - just the TigerBeetle 3-replica cluster"
 	@echo "make broker-up / broker-down  - just RabbitMQ + its exchange/sink topology"
 	@echo "make cdc-up / cdc-down        - just the supervised tigerbeetle amqp job"
@@ -40,16 +42,21 @@ cdc-down:
 ## -- application -------------------------------------------------------------
 
 # Foreground dev server: warm-up rebuilds the pixel cache from TB history,
-# and -cdc-url keeps the cache live-synced off the CDC stream.
+# and -cdc-url keeps the cache live-synced off the CDC stream. GRID defaults to
+# 256x256; pass GRID=1000x1000 for the 1M-pixel showcase (-eager provisions
+# all accounts at startup, idempotent across restarts).
 serve:
 	go run ./cmd/server \
 	  -tb-addresses 127.0.0.1:3000,127.0.0.1:3001,127.0.0.1:3002 \
 	  -addr :8080 \
+	  -grid $(or $(GRID),256x256) \
 	  -cdc-url amqp://guest:guest@127.0.0.1:5672/ \
 	  -cdc-exchange tigerbeetle
 
+# Load generator. GRID must match the running server. Defaults match `make serve`.
 bot:
 	go run ./cmd/bot -target $(or $(TARGET),http://localhost:8080) \
+	  -grid $(or $(GRID),256x256) \
 	  -rps $(or $(RPS),100) -duration $(or $(DURATION),30s) -players $(or $(PLAYERS),64)
 
 build:
