@@ -85,8 +85,9 @@ func (tr *templateRenderer) renderIndex(w io.Writer, svc *game.Service) error {
 		}
 	}
 	return tr.index.ExecuteTemplate(w, "index.html", map[string]any{
-		"Cells": cells,
-		"Cols":  gw,
+		"Cells":   cells,
+		"Cols":    gw,
+		"MaxTsMs": svc.LatestTransferMs(),
 	})
 }
 

@@ -5,6 +5,7 @@ package warm
 
 import (
 	"log/slog"
+	"math"
 	"sort"
 
 	tb "github.com/tigerbeetle/tigerbeetle-go"
@@ -21,6 +22,14 @@ type Pixel struct {
 
 // Scan pages through all canvas-ledger transfers and folds them into pixels.
 func Scan(client *tbclient.Client, gridW, gridH uint32, log *slog.Logger) ([]Pixel, error) {
+	return ScanUpTo(client, gridW, gridH, math.MaxUint64, log)
+}
+
+// ScanUpTo pages through canvas-ledger transfers up to maxTs (nanoseconds,
+// exclusive) and folds them into pixels. Pass math.MaxUint64 to scan
+// everything. maxTs=0 returns an empty canvas (no transfers before epoch).
+// Used by the time-travel slider to reconstruct the canvas as of any point.
+func ScanUpTo(client *tbclient.Client, gridW, gridH uint32, maxTs uint64, log *slog.Logger) ([]Pixel, error) {
 	const limit = 4000
 
 	var all []tb.Transfer
@@ -30,17 +39,26 @@ func Scan(client *tbclient.Client, gridW, gridH uint32, log *slog.Logger) ([]Pix
 		if err != nil {
 			return nil, err
 		}
-		all = append(all, page...)
-		if len(page) < limit {
+		stop := false
+		for _, t := range page {
+			if t.Timestamp > maxTs {
+				stop = true // ascending order: everything after is also past the cutoff
+				break
+			}
+			all = append(all, t)
+		}
+		if stop || len(page) < limit {
 			break
 		}
-		// Timestamps are unique per transfer; inclusive bounds mean we resume
-		// strictly after the last one we already saw.
 		from = page[len(page)-1].Timestamp + 1
 	}
 
 	pixels := Fold(all, gridW, gridH)
-	log.Debug("warm scan complete", "transfers", len(all), "pixels", len(pixels))
+	if maxTs > 0 {
+		log.Debug("replay scan complete", "transfers", len(all), "pixels", len(pixels), "cutoff_ns", maxTs)
+	} else {
+		log.Debug("warm scan complete", "transfers", len(all), "pixels", len(pixels))
+	}
 	return pixels, nil
 }
 

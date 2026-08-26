@@ -18,6 +18,15 @@
         style="--cols: {{.Cols}}"
         data-init="@get('/sse', {openWhenHidden: true})"><!-- @get sees text/event-stream and stays connected; clicks bound natively in app.js -->{{range .Cells}}{{.}}{{end}}</main>
 
+  <footer id="replay-bar" data-signals="{ts_ms: {{.MaxTsMs}}}">
+    <button class="live-btn" data-on:click="window.location.reload()">⏵ Live</button>
+    <span class="replay-badge" data-show="$ts_ms < {{.MaxTsMs}}">◀ REPLAY</span>
+    <input type="range" class="slider" min="0" max="{{.MaxTsMs}}"
+           data-bind="ts_ms"
+           data-on:input__debounce.150ms="@get('/replay')">
+    <span class="time-label" data-text="new Date($ts_ms).toLocaleString()"></span>
+  </footer>
+
   <script type="module" src="/static/datastar.js"></script>
   <script src="/static/app.js"></script>
 </body>

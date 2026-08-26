@@ -214,6 +214,42 @@ func (s *Service) Snapshot() map[uint64]Pixel {
 // Grid returns the canvas dimensions.
 func (s *Service) Grid() (uint32, uint32) { return s.gridW, s.gridH }
 
+// ReplayAsOf rebuilds the canvas state as of a point in time (nanoseconds
+// since epoch) by folding TB transfer history up to that timestamp. This is
+// the time-travel slider's backend: every pixel you see was derived purely
+// from the immutable ledger, not from a snapshot.
+func (s *Service) ReplayAsOf(tsNs uint64) (map[uint64]Pixel, error) {
+	pixels, err := warm.ScanUpTo(s.tb, s.gridW, s.gridH, tsNs, s.log)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[uint64]Pixel, len(pixels))
+	for _, p := range pixels {
+		out[pack(p.X, p.Y)] = Pixel{Color: p.Color, Version: p.Version}
+	}
+	return out, nil
+}
+
+// LatestTransferMs returns the timestamp of the most recent canvas transfer
+// in milliseconds since epoch. Used as the slider's max bound. If there are
+// no transfers, returns 0.
+func (s *Service) LatestTransferMs() uint64 {
+	const limit = 4000
+	var from, last uint64
+	for {
+		page, err := s.tb.QueryCanvasTransfers(from, limit)
+		if err != nil || len(page) == 0 {
+			break
+		}
+		last = page[len(page)-1].Timestamp
+		if len(page) < limit {
+			break
+		}
+		from = last + 1
+	}
+	return last / 1_000_000
+}
+
 // WarmCache rebuilds the pixel cache from TigerBeetle transfer history so a
 // restarted server shows the canvas instead of a blank grid.
 func (s *Service) WarmCache() error {
