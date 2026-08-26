@@ -7,13 +7,9 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/http"
-	"strconv"
-	"strings"
 
 	"github.com/google/uuid"
-	ds "github.com/starfederation/datastar-go/datastar"
 
-	"pixelbeetle/internal/canvas"
 	"pixelbeetle/internal/game"
 	"pixelbeetle/internal/hub"
 )
@@ -45,7 +41,7 @@ func (s *Server) Routes() http.Handler {
 	}
 	mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.FS(staticRoot))))
 	mux.HandleFunc("GET /sse", s.handleSSE)
-	mux.HandleFunc("GET /replay", s.handleReplay) // time-travel slider
+	mux.HandleFunc("GET /history", s.handleHistory) // time-travel manifest (client-side slider)
 	mux.HandleFunc("POST /claim", s.withPlayer(s.handleClaim))
 	mux.HandleFunc("POST /confirm", s.withPlayer(s.handleConfirm))
 	mux.HandleFunc("POST /cancel", s.withPlayer(s.handleCancel))
@@ -71,46 +67,16 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 // ---- SSE ----
 
 func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
-	s.hub.ServeSSE(w, r, nil) // initialSync wired in main once cache warm-up lands
+	s.hub.ServeSSE(w, r, s.svc.SnapshotBmp)
 }
 
 // ---- time travel ----
 
-// handleReplay returns the canvas state as of a timestamp as a single
-// DataStar patch-elements event that replaces #grid's inner content. The
-// slider fires @get('/replay') with ts_ms (milliseconds since epoch).
-func (s *Server) handleReplay(w http.ResponseWriter, r *http.Request) {
-	var tsNs uint64
-	if v := r.URL.Query().Get("ts_ms"); v != "" {
-		ms, _ := strconv.ParseUint(v, 10, 64)
-		tsNs = ms * 1_000_000 // ms → ns
-	}
-
-	pixels, err := s.svc.ReplayAsOf(tsNs)
-	if err != nil {
-		s.log.Error("replay", "err", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-
-	gw, gh := s.svc.Grid()
-	var sb strings.Builder
-	for y := uint32(0); y < gh; y++ {
-		for x := uint32(0); x < gw; x++ {
-			if p, ok := pixels[uint64(x)<<32|uint64(y)]; ok {
-				sb.WriteString(canvas.CellHTML(x, y, "painted", p.Color))
-			} else {
-				sb.WriteString(canvas.CellHTML(x, y, "", 0))
-			}
-		}
-	}
-
-	gen := ds.NewSSE(w, r)
-	if err := gen.PatchElements(sb.String(),
-		ds.WithSelector("#grid"),
-		ds.WithMode(ds.ElementPatchModeInner)); err != nil {
-		s.log.Warn("replay: patch elements", "err", err)
-	}
+// handleHistory returns every posted paint (ascending by timestamp) as a
+// compact JSON manifest. The client fetches it once, then bisects it locally
+// while dragging the slider — no per-tick server round-trip.
+func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, map[string]any{"events": s.svc.History()})
 }
 
 // ---- claims ----

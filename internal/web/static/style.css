@@ -1,4 +1,4 @@
-:root { --cell: 14px; }
+:root { --cell: 6px; }
 * { box-sizing: border-box; }
 body { margin: 0; font-family: system-ui, sans-serif; background: #111; color: #eee; }
 
@@ -8,26 +8,21 @@ h1 { font-size: 1.2rem; margin: 0; }
 #hud button { margin-left: .5rem; cursor: pointer; }
 #hud .countdown { font-size: .8rem; color: #ffd600; }
 
-.grid {
-  display: grid;
-  grid-template-columns: repeat(var(--cols), var(--cell));
-  gap: 1px;
+#canvas-wrap {
   padding: 8px;
-  user-select: none;
+  overflow: auto;
+  max-height: 76vh;
+  border-top: 1px solid #333;
+  border-bottom: 1px solid #333;
 }
-
-.cell {
-  width: var(--cell);
-  height: var(--cell);
-  background: #1c1c1c;
+#grid {
+  display: block;
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+  width: max-content;
+  min-width: 100%;
   cursor: crosshair;
-}
-.cell.painted { cursor: default; }
-.cell.locked { outline: 2px solid #ffd600; outline-offset: -2px; animation: pulse .6s infinite alternate; }
-
-@keyframes pulse {
-  from { filter: brightness(.7); }
-  to   { filter: brightness(1.3); }
+  background: #1c1c1c;
 }
 
 /* time-travel slider */

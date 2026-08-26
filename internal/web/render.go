@@ -12,7 +12,6 @@ import (
 
 	"github.com/google/uuid"
 
-	"pixelbeetle/internal/canvas"
 	"pixelbeetle/internal/game"
 )
 
@@ -59,12 +58,7 @@ type templateRenderer struct {
 }
 
 func newTemplateRenderer() (*templateRenderer, error) {
-	funcs := template.FuncMap{
-		"cellID":   canvas.CellID,
-		"colorCSS": canvas.ColorCSS,
-		"cellHTML": canvas.CellHTML,
-	}
-	idx, err := template.New("index.html").Funcs(funcs).ParseFS(indexHTML, "templates/index.html")
+	idx, err := template.New("index.html").ParseFS(indexHTML, "templates/index.html")
 	if err != nil {
 		return nil, err
 	}
@@ -72,22 +66,16 @@ func newTemplateRenderer() (*templateRenderer, error) {
 }
 
 func (tr *templateRenderer) renderIndex(w io.Writer, svc *game.Service) error {
-	snap := svc.Snapshot()
+	bmpB64, locks := svc.SnapshotBmp()
 	gw, gh := svc.Grid()
-	cells := make([]template.HTML, 0, int(gw)*int(gh))
-	for y := uint32(0); y < gh; y++ {
-		for x := uint32(0); x < gw; x++ {
-			if p, ok := snap[uint64(x)<<32|uint64(y)]; ok { // CellHTML is trusted markup built from ints only
-				cells = append(cells, template.HTML(canvas.CellHTML(x, y, "painted", p.Color)))
-			} else {
-				cells = append(cells, template.HTML(canvas.CellHTML(x, y, "", 0)))
-			}
-		}
-	}
+	initialJSON, _ := json.Marshal(map[string]any{"bmp": bmpB64, "locks": locks})
+	minMs, maxMs := svc.TransferTimeRange()
 	return tr.index.ExecuteTemplate(w, "index.html", map[string]any{
-		"Cells":   cells,
-		"Cols":    gw,
-		"MaxTsMs": svc.LatestTransferMs(),
+		"InitialJSON": template.JS(initialJSON), // valid JSON object; trusted (base64 + ints only)
+		"Cols":        gw,
+		"Rows":        gh,
+		"MinTsMs":     minMs,
+		"MaxTsMs":     maxMs,
 	})
 }
 

@@ -38,6 +38,8 @@ type Config struct {
 	Target   string        // game server base URL (api mode)
 	TBAddrs  []string      // tigerbeetle addresses (direct mode)
 	Cluster  uint64        // tigerbeetle cluster id (direct mode)
+	GridW    uint32        // canvas width  (0 → 256, must match the server)
+	GridH    uint32        // canvas height (0 → 256, must match the server)
 	RPS      int           // target claims/sec
 	Duration time.Duration // total run; 0 = until context cancel
 	Ramp     time.Duration // linear ramp-up window
@@ -72,6 +74,13 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) (*Metrics, error) {
 
 	m := &Metrics{}
 
+	if cfg.GridW == 0 {
+		cfg.GridW = 256
+	}
+	if cfg.GridH == 0 {
+		cfg.GridH = 256
+	}
+
 	var (
 		direct *tbclient.Client
 		err    error
@@ -82,6 +91,15 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) (*Metrics, error) {
 			return nil, fmt.Errorf("bot: connect tigerbeetle: %w", err)
 		}
 		defer direct.Close()
+		// The v2 debit model rejects a claim with accounts-not-found unless
+		// the pixel account exists and is funded. In direct mode there is no
+		// game server to do this, so provision the whole canvas up front
+		// (idempotent; fast on re-run since exists == ok). This keeps the
+		// measured claim/confirm latency free of account-creation noise.
+		log.Info("bot: provisioning pixel accounts (direct mode)", "grid", fmt.Sprintf("%dx%d", cfg.GridW, cfg.GridH), "count", int(cfg.GridW)*int(cfg.GridH))
+		if err := direct.EnsureAllPixels(cfg.GridW, cfg.GridH); err != nil {
+			return nil, fmt.Errorf("bot: ensure all pixels: %w", err)
+		}
 	}
 
 	httpc := &http.Client{Timeout: 5 * time.Second}
@@ -141,8 +159,8 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) (*Metrics, error) {
 				}
 				m.ClaimsStarted.Add(1)
 
-				x := rng.Uint32() % 64 // TODO: wire real grid dims via config
-				y := rng.Uint32() % 64
+				x := rng.Uint32() % cfg.GridW
+				y := rng.Uint32() % cfg.GridH
 				if cfg.Hotspot[0] != 0 || cfg.Hotspot[1] != 0 {
 					x, y = cfg.Hotspot[0], cfg.Hotspot[1]
 				}

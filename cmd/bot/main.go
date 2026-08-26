@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log/slog"
 	"net/http"
 	_ "net/http/pprof"
@@ -20,6 +21,7 @@ func main() {
 		target   = flag.String("target", "http://localhost:8080", "game server base URL (api mode)")
 		tbAddr   = flag.String("tb-addresses", "", "comma-separated TB addresses; enables direct mode")
 		cluster  = flag.Uint64("cluster-id", 0, "TigerBeetle cluster id")
+		grid     = flag.String("grid", "256x256", "canvas size as WxH (must match the game server)")
 		rps      = flag.Int("rps", 100, "target claims/sec")
 		duration = flag.Duration("duration", 30*1e9, "total run duration")
 		ramp     = flag.Duration("ramp", 5*1e9, "linear ramp-up window")
@@ -46,6 +48,10 @@ func main() {
 		Ramp:     *ramp,
 		Players:  *players,
 	}
+	if _, err := fmtSscanGrid(*grid, &cfg.GridW, &cfg.GridH); err != nil {
+		log.Error("invalid -grid, want WxH like 256x256", "got", *grid)
+		os.Exit(1)
+	}
 	if *tbAddr != "" {
 		cfg.TBAddrs = strings.Split(*tbAddr, ",")
 		cfg.Cluster = *cluster
@@ -54,6 +60,10 @@ func main() {
 		var x, y uint32
 		if _, err := fmtSscan(*hotspot, &x, &y); err != nil {
 			log.Error("invalid -hotspot, want x:y", "got", *hotspot)
+			os.Exit(1)
+		}
+		if x >= cfg.GridW || y >= cfg.GridH {
+			log.Error("hotspot out of bounds", "x", x, "y", y, "grid", fmt.Sprintf("%dx%d", cfg.GridW, cfg.GridH))
 			os.Exit(1)
 		}
 		cfg.Hotspot = [2]uint32{x, y}

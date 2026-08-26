@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 	tb "github.com/tigerbeetle/tigerbeetle-go"
 
+	"pixelbeetle/internal/canvas"
 	"pixelbeetle/internal/hub"
 	"pixelbeetle/internal/replay"
 	"pixelbeetle/internal/tbclient"
@@ -30,6 +31,15 @@ type Pixel struct {
 	Version uint64 // equals the pixel account's credits_posted
 }
 
+// PaintEvent is a single posted claim, used by the time-travel slider's
+// client-side manifest (GET /history).
+type PaintEvent struct {
+	TsMs  int64  `json:"ts"`
+	X     uint32 `json:"x"`
+	Y     uint32 `json:"y"`
+	Color uint8  `json:"c"`
+}
+
 // lock is an in-memory gate on top of the durable pending transfer in TB.
 type lock struct {
 	player  uuid.UUID
@@ -44,18 +54,20 @@ type ClaimMeta struct {
 }
 
 type Service struct {
-	mu       sync.Mutex
-	gridW    uint32
-	gridH    uint32
-	pixels   map[uint64]Pixel // key = pack(x,y)
-	locks    map[uint64]lock
-	claims   map[[16]byte]ClaimMeta // claim transfer id -> meta, until resolved
-	byPlayer map[uuid.UUID][16]byte // player -> their single active claim
-	created  map[uint64]struct{}    // pixel accounts already ensured in TB
-	hub      *hub.Hub
-	tb       *tbclient.Client
-	log      *slog.Logger
-	sysOnce  sync.Once
+	mu         sync.Mutex
+	gridW      uint32
+	gridH      uint32
+	pixels     map[uint64]Pixel // key = pack(x,y)
+	locks      map[uint64]lock
+	claims     map[[16]byte]ClaimMeta // claim transfer id -> meta, until resolved
+	byPlayer   map[uuid.UUID][16]byte // player -> their single active claim
+	created    map[uint64]struct{}    // pixel accounts already ensured in TB
+	allCreated bool                   // true once every pixel account is eagerly created+funded
+	history    []PaintEvent           // posted claims, ascending ts — the slider manifest (in-memory)
+	hub        *hub.Hub
+	tb         *tbclient.Client
+	log        *slog.Logger
+	sysOnce    sync.Once
 }
 
 func New(w, h uint32, tb *tbclient.Client, h2 *hub.Hub, log *slog.Logger) *Service {
@@ -127,11 +139,11 @@ func (s *Service) Claim(player uuid.UUID, x, y uint32, color uint8) ([16]byte, e
 		if err := s.tb.Submit(tbclient.BuildVoid(u128(old.Transfer))); err != nil {
 			s.log.Warn("failed to void superseded claim", "err", err)
 		} else {
-			s.hub.PixelUnlocked(old.X, old.Y)
+			s.hub.BroadcastUnlock(old.X, old.Y)
 		}
 	}
 
-	s.hub.PixelLocked(x, y)
+	s.hub.BroadcastLock(x, y)
 	return id, nil
 }
 
@@ -165,10 +177,14 @@ func (s *Service) Confirm(player uuid.UUID, claimID [16]byte) error {
 	key := pack(meta.X, meta.Y)
 	prev := s.pixels[key]
 	s.pixels[key] = Pixel{Color: meta.Color, Version: prev.Version + 1}
+	s.history = append(s.history, PaintEvent{TsMs: time.Now().UnixMilli(), X: meta.X, Y: meta.Y, Color: meta.Color})
 	s.vacate(claimID, key)
 	s.mu.Unlock()
 
-	s.hub.PixelPainted(meta.X, meta.Y, meta.Color)
+	// The pixel is now painted, so its pending lock is released — clear the
+	// lock overlay in the same flush as the paint.
+	s.hub.BroadcastUnlock(meta.X, meta.Y)
+	s.hub.BroadcastPaint(meta.X, meta.Y, meta.Color)
 	return nil
 }
 
@@ -185,7 +201,7 @@ func (s *Service) Cancel(player uuid.UUID, claimID [16]byte) error {
 	s.mu.Lock()
 	s.vacate(claimID, pack(meta.X, meta.Y))
 	s.mu.Unlock()
-	s.hub.PixelUnlocked(meta.X, meta.Y)
+	s.hub.BroadcastUnlock(meta.X, meta.Y)
 	return nil
 }
 
@@ -211,58 +227,89 @@ func (s *Service) Snapshot() map[uint64]Pixel {
 	return out
 }
 
+// SnapshotBmp returns the full canvas as a base64 packed bitmap (one byte per
+// cell; 0 = empty, 1..16 = palette color + 1) plus the currently locked cells.
+// It's the SSE connect payload and the SSR initial state.
+func (s *Service) SnapshotBmp() (string, [][2]uint32) {
+	bmp := canvas.NewBitmap(s.gridW, s.gridH)
+	now := time.Now()
+	var locks [][2]uint32
+
+	s.mu.Lock()
+	for k, p := range s.pixels {
+		bmp.Set(uint32(k>>32), uint32(k&0xffffffff), p.Color%16+1)
+	}
+	for k, l := range s.locks {
+		if now.Before(l.expires) {
+			locks = append(locks, [2]uint32{uint32(k >> 32), uint32(k & 0xffffffff)})
+		}
+	}
+	s.mu.Unlock()
+
+	return bmp.Base64(), locks
+}
+
 // Grid returns the canvas dimensions.
 func (s *Service) Grid() (uint32, uint32) { return s.gridW, s.gridH }
 
-// ReplayAsOf rebuilds the canvas state as of a point in time (nanoseconds
-// since epoch) by folding TB transfer history up to that timestamp. This is
-// the time-travel slider's backend: every pixel you see was derived purely
-// from the immutable ledger, not from a snapshot.
-func (s *Service) ReplayAsOf(tsNs uint64) (map[uint64]Pixel, error) {
-	pixels, err := warm.ScanUpTo(s.tb, s.gridW, s.gridH, tsNs, s.log)
-	if err != nil {
-		return nil, err
-	}
-	out := make(map[uint64]Pixel, len(pixels))
-	for _, p := range pixels {
-		out[pack(p.X, p.Y)] = Pixel{Color: p.Color, Version: p.Version}
-	}
-	return out, nil
+// History returns the posted-claim manifest (ascending by timestamp) for the
+// time-travel slider. It's kept in memory (built by WarmCache, appended on
+// each confirm), so the client fetch is O(1) — no per-request TB scan.
+func (s *Service) History() []PaintEvent {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]PaintEvent, len(s.history))
+	copy(out, s.history)
+	return out
 }
 
-// LatestTransferMs returns the timestamp of the most recent canvas transfer
-// in milliseconds since epoch. Used as the slider's max bound. If there are
-// no transfers, returns 0.
-func (s *Service) LatestTransferMs() uint64 {
-	const limit = 4000
-	var from, last uint64
-	for {
-		page, err := s.tb.QueryCanvasTransfers(from, limit)
-		if err != nil || len(page) == 0 {
-			break
-		}
-		last = page[len(page)-1].Timestamp
-		if len(page) < limit {
-			break
-		}
-		from = last + 1
+// TransferTimeRange returns the earliest and latest canvas transfer timestamps
+// in milliseconds since epoch. Used as the time-travel slider's min/max bounds
+// so the slider spans the actual data range (not epoch→now, which leaves 99%
+// blank). Returns (0,0) when there are no transfers.
+func (s *Service) TransferTimeRange() (uint64, uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.history) == 0 {
+		return 0, 0
 	}
-	return last / 1_000_000
+	return uint64(s.history[0].TsMs), uint64(s.history[len(s.history)-1].TsMs)
 }
 
 // WarmCache rebuilds the pixel cache from TigerBeetle transfer history so a
 // restarted server shows the canvas instead of a blank grid.
 func (s *Service) WarmCache() error {
-	pixels, err := warm.Scan(s.tb, s.gridW, s.gridH, s.log)
-	if err != nil {
-		return err
+	const limit = 4000
+	seen := make(map[uint64]Pixel)
+	var history []PaintEvent
+	var from uint64
+	for {
+		page, err := s.tb.QueryCanvasTransfers(from, limit)
+		if err != nil {
+			return err
+		}
+		for _, t := range page {
+			x, y, color, ok := warm.PostedClaim(t, s.gridW, s.gridH)
+			if !ok {
+				continue
+			}
+			key := pack(x, y)
+			prev := seen[key]
+			seen[key] = Pixel{Color: color, Version: prev.Version + 1}
+			history = append(history, PaintEvent{TsMs: int64(t.Timestamp / 1_000_000), X: x, Y: y, Color: color})
+		}
+		if len(page) < limit {
+			break
+		}
+		from = page[len(page)-1].Timestamp + 1
 	}
 	s.mu.Lock()
-	for _, p := range pixels {
-		s.pixels[pack(p.X, p.Y)] = Pixel{Color: p.Color, Version: p.Version}
+	for k, p := range seen {
+		s.pixels[k] = p
 	}
+	s.history = history
 	s.mu.Unlock()
-	s.log.Info("warmed pixel cache", "count", len(pixels))
+	s.log.Info("warmed pixel cache", "pixels", len(seen), "history", len(history))
 	return nil
 }
 
@@ -282,8 +329,9 @@ func (s *Service) ApplyEvent(ev replay.Event) {
 		return
 	}
 	s.pixels[key] = Pixel{Color: ev.Color, Version: cur.Version + 1}
+	s.history = append(s.history, PaintEvent{TsMs: int64(ev.Timestamp / 1_000_000), X: ev.X, Y: ev.Y, Color: ev.Color})
 	s.mu.Unlock()
-	s.hub.PixelPainted(ev.X, ev.Y, ev.Color)
+	s.hub.BroadcastPaint(ev.X, ev.Y, ev.Color)
 }
 
 // ReapExpired drops stale in-memory locks. TigerBeetle auto-expires the
@@ -312,11 +360,25 @@ func (s *Service) ReapExpired() {
 	}
 	s.mu.Unlock()
 	for _, c := range unlocked {
-		s.hub.PixelUnlocked(c[0], c[1])
+		s.hub.BroadcastUnlock(c[0], c[1])
 	}
 	if n > 0 {
 		s.log.Debug("reaped expired locks", "count", n)
 	}
+}
+
+// InitAllPixels eagerly creates and funds every pixel account up front (the
+// "one million accounts before the first pixel" demo line), so first-touch
+// claims never pay an account-creation round-trip.
+func (s *Service) InitAllPixels() error {
+	if err := s.tb.EnsureAllPixels(s.gridW, s.gridH); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.allCreated = true
+	s.mu.Unlock()
+	s.log.Info("eagerly created and funded all pixel accounts", "count", int(s.gridW)*int(s.gridH))
+	return nil
 }
 
 func (s *Service) ensureSystemPool() {
@@ -334,11 +396,11 @@ func (s *Service) ensureSystemPool() {
 // funds its single claimable unit. Both steps are idempotent across restarts
 // (exists == ok).
 func (s *Service) ensurePixel(x, y uint32) {
-	key := pack(x, y)
 	s.mu.Lock()
-	_, ok := s.created[key]
+	all := s.allCreated
+	_, ok := s.created[pack(x, y)]
 	s.mu.Unlock()
-	if ok {
+	if all || ok {
 		return
 	}
 	if err := s.tb.EnsureAccounts(tbclient.PixelID(x, y)); err != nil {
@@ -350,7 +412,7 @@ func (s *Service) ensurePixel(x, y uint32) {
 		return
 	}
 	s.mu.Lock()
-	s.created[key] = struct{}{}
+	s.created[pack(x, y)] = struct{}{}
 	s.mu.Unlock()
 }
 

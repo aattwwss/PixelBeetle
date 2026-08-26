@@ -6,27 +6,29 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <link rel="stylesheet" href="/static/style.css">
 </head>
-<body>
+<body data-signals="{bmp: null, deltas: [], lockAdds: [], lockRemoves: [], locks: [], tsMs: {{.MaxTsMs}}}">
   <header>
     <h1>Canvas Clash</h1>
     <p class="tagline">every pixel is a TigerBeetle transfer</p>
-    <div id="hud" data-signals="{claimId: null, locked: false}"></div>
+    <div id="hud"></div>
   </header>
 
-  <main id="grid"
-        class="grid"
-        style="--cols: {{.Cols}}"
-        data-init="@get('/sse', {openWhenHidden: true})"><!-- @get sees text/event-stream and stays connected; clicks bound natively in app.js -->{{range .Cells}}{{.}}{{end}}</main>
+  <div id="canvas-wrap">
+    <canvas id="grid" width="{{.Cols}}" height="{{.Rows}}"
+            data-init="@get('/sse', {openWhenHidden: true})"></canvas>
+    <div data-effect="pb.render($bmp, $deltas, $lockAdds, $lockRemoves, $locks)"></div>
+  </div>
 
-  <footer id="replay-bar" data-signals="{ts_ms: {{.MaxTsMs}}}">
-    <button class="live-btn" data-on:click="window.location.reload()">⏵ Live</button>
-    <span class="replay-badge" data-show="$ts_ms < {{.MaxTsMs}}">◀ REPLAY</span>
-    <input type="range" class="slider" min="0" max="{{.MaxTsMs}}"
-           data-bind="ts_ms"
-           data-on:input__debounce.150ms="@get('/replay')">
-    <span class="time-label" data-text="new Date($ts_ms).toLocaleString()"></span>
+  <footer id="replay-bar">
+    <button class="live-btn" data-on:click="pb.live()">⏵ Live</button>
+    <span class="replay-badge" data-show="$tsMs < {{.MaxTsMs}}">◀ REPLAY</span>
+    <input type="range" class="slider" min="{{.MinTsMs}}" max="{{.MaxTsMs}}" value="{{.MaxTsMs}}"
+           data-bind="tsMs"
+           data-on:input="pb.scrub(evt.target.value)">
+    <span class="time-label" data-text="new Date($tsMs).toLocaleString()"></span>
   </footer>
 
+  <script id="initial-state" type="application/json">{{.InitialJSON}}</script>
   <script type="module" src="/static/datastar.js"></script>
   <script src="/static/app.js"></script>
 </body>

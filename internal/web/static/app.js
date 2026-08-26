@@ -1,68 +1,217 @@
 // Canvas Clash client glue.
 //
-// Input path (click → claim) uses one delegated listener + fetch because a
-// 16k-cell grid can't carry per-cell handlers. Output path (server → client
-// paint/lock/unlock) is pure DataStar SSE patches — see internal/hub.
+// The grid is a <canvas> drawn from a packed byte array (one byte per cell;
+// 0 = empty, 1..16 = palette color + 1). The server ships the canvas as
+// DataStar signals:
+//
+//   on connect:  bmp (base64), locks ([[x,y],...])
+//   live flush:  deltas ([[x,y,color],...]), lockAdds, lockRemoves
+//
+// A single DataStar effect calls pb.render() whenever any of those signals
+// change; pb.render diffs against the previous values and draws only what
+// changed. Time travel is client-side: the slider bisects a manifest fetched
+// once from GET /history and redraws the canvas — no per-tick server round trip.
 
-let activeClaim = null;
-let claimTimer = null;
+const PALETTE = ["#ffffff", "#e4e4e4", "#888888", "#222222", "#ffb470", "#9a6324", "#800000", "#ba2d2d",
+                 "#ffd600", "#808000", "#469990", "#42d4f4", "#4363d8", "#000075", "#f032e6", "#fabed4"];
+const PALETTE_RGB = PALETTE.map(h => [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)]);
+const EMPTY_RGB = [0x1c, 0x1c, 0x1c];
+const LOCK_RGB = [0xff, 0xd6, 0x00];
 
-// One delegated listener for the whole grid: cells come and go via SSE patches,
-// the grid element itself never changes.
-document.getElementById('grid').addEventListener('click', (evt) => {
-  claimClick(evt);
-});
+const pb = {};
+window.pb = pb;
 
-async function claimClick(evt) {
-  const el = evt.target.closest('.cell');
-  if (!el || el.classList.contains('locked') || el.classList.contains('painted')) return;
+let canvas, ctx, cols, rows;
+let liveBmp = null;      // Uint8Array W*H (bitmap values 0..16)
+let lockSet = new Set(); // "x,y" strings currently locked
+let scrubEvents = null;  // [{ts,x,y,c}] sorted ascending, from GET /history
+let scrubbing = false;
+let currentClaimId = null;
 
-  const x = Number(el.dataset.x), y = Number(el.dataset.y);
-  const color = Math.floor(Math.random() * 16); // TODO: real palette picker
+// Reference tracking so each signal value is applied exactly once (a flush
+// that changes lockAdds but not deltas must not re-apply the stale deltas).
+let lastBmp = null, lastDeltas = null, lastLockAdds = null, lastLockRemoves = null, lastLocks = null;
 
+function init() {
+  canvas = document.getElementById('grid');
+  ctx = canvas.getContext('2d');
+  cols = canvas.width;
+  rows = canvas.height;
+  liveBmp = new Uint8Array(cols * rows);
+
+  // Initial state from SSR (instant first paint, no flash).
+  const initEl = document.getElementById('initial-state');
+  if (initEl) {
+    try {
+      const s = JSON.parse(initEl.textContent);
+      if (s && typeof s.bmp === 'string') {
+        const bytes = atob(s.bmp);
+        for (let i = 0; i < bytes.length; i++) liveBmp[i] = bytes.charCodeAt(i);
+        lastBmp = s.bmp;
+        renderFull();
+      }
+      if (Array.isArray(s.locks)) {
+        lockSet = new Set(s.locks.map(([x, y]) => `${x},${y}`));
+        renderFull();
+      }
+    } catch (e) {
+      console.warn('initial state parse failed', e);
+    }
+  }
+
+  canvas.addEventListener('click', onCanvasClick);
+
+  fetch('/history')
+    .then(r => r.json())
+    .then(h => { scrubEvents = h.events || []; })
+    .catch(e => console.warn('history fetch failed', e));
+}
+
+// ---- input: click -> claim (two-phase: claim, then confirm/cancel in HUD) ----
+
+function onCanvasClick(evt) {
+  if (scrubbing) return; // no claims while time-traveling
+  const rect = canvas.getBoundingClientRect();
+  const x = Math.floor((evt.clientX - rect.left) / rect.width * cols);
+  const y = Math.floor((evt.clientY - rect.top) / rect.height * rows);
+  if (x < 0 || y < 0 || x >= cols || y >= rows) return;
+  claim(x, y);
+}
+
+async function claim(x, y) {
+  const color = Math.floor(Math.random() * 16); // TODO: palette picker
   const res = await fetch('/claim', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ x, y, color }),
   });
   if (!res.ok) {
-    console.warn('claim rejected:', res.status, await res.text());
+    console.warn('claim rejected', res.status, await res.text());
     return;
   }
   const { claimId } = await res.json();
-  showHud(claimId, el);
-}
-
-function showHud(claimId, cellEl) {
-  cancelClaim(); // one pending claim at a time (per player)
-  activeClaim = { id: claimId, cellEl };
-
-  // The lock window matches the transfer's `timeout` (3s). When it lapses,
-  // TigerBeetle auto-expires the pending transfer and CDC emits
-  // two_phase_expired — the server-side reaper unlocks the UI.
-  claimTimer = setTimeout(() => cancelClaim(), 2800);
-
+  currentClaimId = claimId;
   const hud = document.getElementById('hud');
   hud.innerHTML = `
     <span class="countdown">confirm within 3s…</span>
-    <button onclick="resolve(true)">paint it</button>
-    <button onclick="resolve(false)">cancel</button>`;
+    <button onclick="pb.confirm()">paint it</button>
+    <button onclick="pb.cancel()">cancel</button>`;
 }
 
-async function resolve(confirm) {
-  if (!activeClaim) return;
-  const { id } = activeClaim;
-  clearTimeout(claimTimer);
-  activeClaim = null;
+pb.confirm = async function () { await resolveClaim('/confirm'); };
+pb.cancel = async function () { await resolveClaim('/cancel'); };
 
-  await fetch(confirm ? '/confirm' : '/cancel', {
+async function resolveClaim(path) {
+  if (!currentClaimId) return;
+  const id = currentClaimId;
+  currentClaimId = null;
+  document.getElementById('hud').innerHTML = '';
+  await fetch(path, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ claimId: id }),
   });
-  document.getElementById('hud').innerHTML = '';
 }
 
-function cancelClaim() {
-  if (claimTimer) { clearTimeout(claimTimer); claimTimer = null; }
+// ---- canvas drawing (1px per cell; CSS scales up with pixelated rendering) ----
+
+function fillCell(x, y) {
+  const key = `${x},${y}`;
+  const v = liveBmp[y * cols + x];
+  let rgb;
+  if (lockSet.has(key)) rgb = LOCK_RGB;
+  else rgb = v ? PALETTE_RGB[(v - 1) % 16] : EMPTY_RGB;
+  ctx.fillStyle = `rgb(${rgb[0]},${rgb[1]},${rgb[2]})`;
+  ctx.fillRect(x, y, 1, 1);
 }
+
+function renderFull() {
+  const img = ctx.createImageData(cols, rows);
+  const d = img.data;
+  for (let i = 0; i < liveBmp.length; i++) {
+    const v = liveBmp[i];
+    const rgb = v ? PALETTE_RGB[(v - 1) % 16] : EMPTY_RGB;
+    const o = i * 4;
+    d[o] = rgb[0]; d[o + 1] = rgb[1]; d[o + 2] = rgb[2]; d[o + 3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+  ctx.fillStyle = `rgb(${LOCK_RGB[0]},${LOCK_RGB[1]},${LOCK_RGB[2]})`;
+  for (const key of lockSet) {
+    const [x, y] = key.split(',').map(Number);
+    ctx.fillRect(x, y, 1, 1);
+  }
+}
+
+// ---- DataStar effect dispatcher (called when bmp/deltas/lock signals patch) ----
+
+pb.render = function (bmp, deltas, lockAdds, lockRemoves, locks) {
+  if (bmp && bmp !== lastBmp) {
+    lastBmp = bmp;
+    const bytes = atob(bmp);
+    if (bytes.length === liveBmp.length) {
+      for (let i = 0; i < bytes.length; i++) liveBmp[i] = bytes.charCodeAt(i);
+    }
+    if (!scrubbing) renderFull();
+  }
+
+  if (deltas && deltas !== lastDeltas) {
+    lastDeltas = deltas;
+    for (const [x, y, v] of deltas) liveBmp[y * cols + x] = v;
+    if (!scrubbing) for (const [x, y] of deltas) fillCell(x, y);
+  }
+
+  if (locks !== lastLocks) {
+    lastLocks = locks;
+    lockSet = new Set((locks || []).map(([x, y]) => `${x},${y}`));
+    if (!scrubbing) renderFull();
+  }
+  if (lockAdds && lockAdds !== lastLockAdds) {
+    lastLockAdds = lockAdds;
+    for (const [x, y] of (lockAdds || [])) lockSet.add(`${x},${y}`);
+    if (!scrubbing) for (const [x, y] of (lockAdds || [])) fillCell(x, y);
+  }
+  if (lockRemoves && lockRemoves !== lastLockRemoves) {
+    lastLockRemoves = lockRemoves;
+    for (const [x, y] of (lockRemoves || [])) lockSet.delete(`${x},${y}`);
+    if (!scrubbing) for (const [x, y] of (lockRemoves || [])) fillCell(x, y);
+  }
+};
+
+// ---- time travel (client-side) ----
+
+pb.scrub = function (tsMs) {
+  if (!scrubEvents) return;
+  scrubbing = true;
+  const idx = bisect(scrubEvents, Number(tsMs));
+  const tmp = new Uint8Array(cols * rows);
+  for (let i = 0; i < idx; i++) {
+    const e = scrubEvents[i];
+    tmp[e.y * cols + e.x] = (e.c % 16) + 1;
+  }
+  const img = ctx.createImageData(cols, rows);
+  const d = img.data;
+  for (let i = 0; i < tmp.length; i++) {
+    const v = tmp[i];
+    const rgb = v ? PALETTE_RGB[(v - 1) % 16] : EMPTY_RGB;
+    const o = i * 4;
+    d[o] = rgb[0]; d[o + 1] = rgb[1]; d[o + 2] = rgb[2]; d[o + 3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+};
+
+pb.live = function () {
+  window.location.reload(); // simplest correct reset back to live + SSE
+};
+
+// number of events with ts <= target (first index past the cutoff)
+function bisect(events, ts) {
+  let lo = 0, hi = events.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (events[mid].ts <= ts) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
+init();

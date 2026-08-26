@@ -77,12 +77,21 @@ func UnpackPixelID(id tb.Uint128) (x, y uint32, ok bool) {
 // EnsureAccounts idempotently creates the system pool plus any pixel accounts.
 // AccountExists and AccountCreated are both treated as success.
 func (c *Client) EnsureAccounts(pixelIDs ...tb.Uint128) error {
+	return c.createAccounts(true, pixelIDs...)
+}
+
+// createAccounts creates the given pixel accounts (and optionally the system
+// pool). Batched callers pass includeSystemPool=false so the pool isn't
+// re-added to every batch.
+func (c *Client) createAccounts(includeSystemPool bool, pixelIDs ...tb.Uint128) error {
 	accounts := make([]tb.Account, 0, len(pixelIDs)+1)
-	accounts = append(accounts, tb.Account{
-		ID:     SystemPoolID,
-		Ledger: LedgerCanvas,
-		Code:   AccountCodeSystem,
-	})
+	if includeSystemPool {
+		accounts = append(accounts, tb.Account{
+			ID:     SystemPoolID,
+			Ledger: LedgerCanvas,
+			Code:   AccountCodeSystem,
+		})
+	}
 	for _, id := range pixelIDs {
 		accounts = append(accounts, tb.Account{
 			ID:     id,
@@ -105,6 +114,73 @@ func (c *Client) EnsureAccounts(pixelIDs ...tb.Uint128) error {
 	return nil
 }
 
+// batchSize stays just under TigerBeetle's 8190 max so a full batch always fits.
+const batchSize = 8189
+
+// EnsureAllPixels eagerly creates and funds every pixel account in the grid in
+// batches. One million pixels ≈ 122 create batches + 122 fund batches.
+// Idempotent across restarts (AccountExists / TransferExists are success).
+func (c *Client) EnsureAllPixels(w, h uint32) error {
+	if err := c.EnsureAccounts(); err != nil { // system pool once
+		return err
+	}
+
+	n := int(w) * int(h)
+	ids := make([]tb.Uint128, 0, batchSize)
+	for i := 0; i < n; i++ {
+		ids = append(ids, PixelID(uint32(i)%w, uint32(i)/w))
+		if len(ids) == batchSize {
+			if err := c.createAccounts(false, ids...); err != nil {
+				return err
+			}
+			ids = ids[:0]
+		}
+	}
+	if len(ids) > 0 {
+		if err := c.createAccounts(false, ids...); err != nil {
+			return err
+		}
+	}
+
+	transfers := make([]tb.Transfer, 0, batchSize)
+	for i := 0; i < n; i++ {
+		x, y := uint32(i)%w, uint32(i)/w
+		transfers = append(transfers, tb.Transfer{
+			ID:              FundID(x, y),
+			DebitAccountID:  SystemPoolID,
+			CreditAccountID: PixelID(x, y),
+			Amount:          tb.ToUint128(1),
+			Code:            TransferCodeRefund,
+			Ledger:          LedgerCanvas,
+		})
+		if len(transfers) == batchSize {
+			if err := c.submitFundBatch(transfers); err != nil {
+				return err
+			}
+			transfers = transfers[:0]
+		}
+	}
+	if len(transfers) > 0 {
+		if err := c.submitFundBatch(transfers); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Client) submitFundBatch(transfers []tb.Transfer) error {
+	results, err := c.tb.CreateTransfers(transfers)
+	if err != nil {
+		return fmt.Errorf("tbclient: fund batch: %w", err)
+	}
+	for _, r := range results {
+		if r.Status != tb.TransferCreated && r.Status != tb.TransferExists {
+			return fmt.Errorf("tbclient: fund batch failed: status=%s", r.Status)
+		}
+	}
+	return nil
+}
+
 // FundID derives the deterministic fund-transfer id for a pixel. Using a
 // stable id makes funding idempotent across server restarts (exists == ok).
 func FundID(x, y uint32) tb.Uint128 {
@@ -114,10 +190,10 @@ func FundID(x, y uint32) tb.Uint128 {
 	return tb.BytesToUint128(b)
 }
 
-// Fund credits the pixel account with its single spendable unit. Idempotent:
-// re-submitting returns TransferExists and is treated as success.
-func (c *Client) Fund(x, y uint32) error {
-	t := tb.Transfer{
+// fundTransfer builds the single-phase transfer that credits a pixel with its
+// one spendable unit. The deterministic FundID makes re-submission idempotent.
+func fundTransfer(x, y uint32) tb.Transfer {
+	return tb.Transfer{
 		ID:              FundID(x, y),
 		DebitAccountID:  SystemPoolID,
 		CreditAccountID: PixelID(x, y),
@@ -125,16 +201,12 @@ func (c *Client) Fund(x, y uint32) error {
 		Code:            TransferCodeRefund,
 		Ledger:          LedgerCanvas,
 	}
-	results, err := c.tb.CreateTransfers([]tb.Transfer{t})
-	if err != nil {
-		return fmt.Errorf("tbclient: fund: %w", err)
-	}
-	for _, r := range results {
-		if r.Status != tb.TransferCreated && r.Status != tb.TransferExists {
-			return fmt.Errorf("tbclient: fund failed: status=%s", r.Status)
-		}
-	}
-	return nil
+}
+
+// Fund credits the pixel account with its single spendable unit. Idempotent:
+// re-submitting returns TransferExists and is treated as success.
+func (c *Client) Fund(x, y uint32) error {
+	return c.SubmitBatch([]tb.Transfer{fundTransfer(x, y)})
 }
 
 // NewClaim builds the pending transfer that locks a pixel for a player.

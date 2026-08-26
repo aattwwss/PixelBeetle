@@ -22,10 +22,11 @@ func main() {
 		addr        = flag.String("addr", ":8080", "http listen address")
 		tbAddr      = flag.String("tb-addresses", "127.0.0.1:3000", "comma-separated TigerBeetle replica addresses")
 		clusterID   = flag.Uint64("cluster-id", 0, "TigerBeetle cluster id")
-		grid        = flag.String("grid", "64x64", "canvas size as WxH")
+		grid        = flag.String("grid", "256x256", "canvas size as WxH (1000x1000 for the 1M-pixel demo)")
 		logLevel    = flag.String("log", "info", "log level (debug|info|warn|error)")
 		reapPeriod  = flag.Duration("reap-period", time.Second, "lock reaper interval")
 		warmup      = flag.Bool("warmup", true, "rebuild pixel cache from TigerBeetle transfer history at startup")
+		eager       = flag.Bool("eager", true, "create+fund all pixel accounts at startup (N accounts before the first paint)")
 		cdcURL      = flag.String("cdc-url", "", "AMQP URL for the TigerBeetle CDC stream (empty = disabled), e.g. amqp://guest:guest@localhost:5672/")
 		cdcExchange = flag.String("cdc-exchange", "tigerbeetle", "AMQP exchange the CDC job publishes to")
 	)
@@ -57,6 +58,13 @@ func main() {
 
 	h := hub.New(log)
 	svc := game.New(gw, gh, client, h, log)
+
+	if *eager {
+		if err := svc.InitAllPixels(); err != nil {
+			log.Error("eager pixel init", "err", err)
+			os.Exit(1)
+		}
+	}
 
 	if *warmup {
 		if err := svc.WarmCache(); err != nil {
