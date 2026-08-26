@@ -68,6 +68,7 @@ type Service struct {
 	tb         *tbclient.Client
 	log        *slog.Logger
 	sysOnce    sync.Once
+	metrics    metrics
 }
 
 func New(w, h uint32, tb *tbclient.Client, h2 *hub.Hub, log *slog.Logger) *Service {
@@ -128,10 +129,13 @@ func (s *Service) Claim(player uuid.UUID, x, y uint32, color uint8) ([16]byte, e
 		delete(s.byPlayer, player)
 		s.mu.Unlock()
 		if errors.Is(err, tbclient.ErrPixelLocked) {
+			s.metrics.conflicts.Add(1)
 			return [16]byte{}, ErrLockedByOther
 		}
+		s.metrics.errors.Add(1)
 		return [16]byte{}, err
 	}
+	s.metrics.claims.Add(1)
 
 	// Void the superseded pending transfer. If this fails the transfer still
 	// self-expires in TB after its timeout; the UI is already consistent.
@@ -170,8 +174,10 @@ func (s *Service) Confirm(player uuid.UUID, claimID [16]byte) error {
 	}
 	confirm := tbclient.BuildConfirm(u128(meta.Transfer), meta.X, meta.Y)
 	if err := s.tb.SubmitBatch(confirm); err != nil {
+		s.metrics.errors.Add(1)
 		return err
 	}
+	s.metrics.confirms.Add(1)
 
 	s.mu.Lock()
 	key := pack(meta.X, meta.Y)
@@ -198,6 +204,7 @@ func (s *Service) Cancel(player uuid.UUID, claimID [16]byte) error {
 	if err := s.tb.Submit(void); err != nil {
 		return err
 	}
+	s.metrics.cancels.Add(1)
 	s.mu.Lock()
 	s.vacate(claimID, pack(meta.X, meta.Y))
 	s.mu.Unlock()
@@ -363,6 +370,7 @@ func (s *Service) ReapExpired() {
 		s.hub.BroadcastUnlock(c[0], c[1])
 	}
 	if n > 0 {
+		s.metrics.expires.Add(uint64(n))
 		s.log.Debug("reaped expired locks", "count", n)
 	}
 }
@@ -414,6 +422,20 @@ func (s *Service) ensurePixel(x, y uint32) {
 	s.mu.Lock()
 	s.created[pack(x, y)] = struct{}{}
 	s.mu.Unlock()
+}
+
+// TickMetrics recomputes rolling per-second throughput. Called by the web
+// layer's 1s ticker (single goroutine).
+func (s *Service) TickMetrics() { s.metrics.tick() }
+
+// MetricsSnapshot returns the dashboard counters: server-side totals, rolling
+// throughput, and current lock/pixel counts.
+func (s *Service) MetricsSnapshot() map[string]any {
+	s.mu.Lock()
+	locks := len(s.locks)
+	pixels := len(s.pixels)
+	s.mu.Unlock()
+	return s.metrics.snapshot(locks, pixels)
 }
 
 func (s *Service) Describe() string {

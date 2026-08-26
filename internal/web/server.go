@@ -3,10 +3,13 @@
 package web
 
 import (
+	"context"
 	"errors"
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"sync"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -19,6 +22,22 @@ type Server struct {
 	hub  *hub.Hub
 	log  *slog.Logger
 	tmpl *templateRenderer
+
+	botMu sync.Mutex
+	bot   *botReport // latest bot heartbeat posted to /admin/bots
+}
+
+// botReport is the heartbeat the load generator POSTs to /admin/bots so the
+// dashboard can show end-to-end (API-path) latency alongside the server's own
+// counters.
+type botReport struct {
+	Claims    uint64  `json:"claims"`
+	Confirmed uint64  `json:"confirmed"`
+	Conflicts uint64  `json:"conflicts"`
+	Errors    uint64  `json:"errors"`
+	P50Ms     float64 `json:"p50Ms"`
+	P99Ms     float64 `json:"p99Ms"`
+	RPS       int     `json:"rps"`
 }
 
 func New(svc *game.Service, h *hub.Hub, log *slog.Logger) (*Server, error) {
@@ -49,9 +68,41 @@ func (s *Server) Routes() http.Handler {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(s.svc.Describe()))
 	})
-	mux.HandleFunc("POST /admin/bots", s.handleAdminBots) // reserved; see plan.md §4.1
+	mux.HandleFunc("POST /admin/bots", s.handleAdminBots) // bot load-generator heartbeat
 
 	return mux
+}
+
+// StartMetrics launches a 1s goroutine that rolls the game service's
+// throughput counters, merges the latest bot heartbeat and the viewer count,
+// and broadcasts the dashboard snapshot over the SSE hub.
+func (s *Server) StartMetrics(ctx context.Context) {
+	go func() {
+		t := time.NewTicker(time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+			}
+			s.svc.TickMetrics()
+			merged := s.svc.MetricsSnapshot()
+			merged["viewers"] = s.hub.Count()
+			s.botMu.Lock()
+			if b := s.bot; b != nil {
+				merged["botClaims"] = b.Claims
+				merged["botConfirmed"] = b.Confirmed
+				merged["botConflicts"] = b.Conflicts
+				merged["botErrors"] = b.Errors
+				merged["botP50Ms"] = b.P50Ms
+				merged["botP99Ms"] = b.P99Ms
+				merged["botRps"] = b.RPS
+			}
+			s.botMu.Unlock()
+			s.hub.BroadcastMetrics(merged)
+		}
+	}()
 }
 
 // ---- pages ----
@@ -174,8 +225,18 @@ func (s *Server) failClaim(w http.ResponseWriter, err error) {
 	}
 }
 
-// ---- admin (reserved for live bot control, plan.md §4.1) ----
+// ---- admin (bot load-generator heartbeat for the dashboard, plan.md §4.1) ----
 
-func (s *Server) handleAdminBots(w http.ResponseWriter, _ *http.Request) {
-	http.Error(w, "not implemented yet", http.StatusNotImplemented)
+// handleAdminBots absorbs the load generator's periodic heartbeat. It validates
+// nothing beyond JSON shape (demo telemetry); the merged snapshot is pushed to
+// browsers over the SSE hub.
+func (s *Server) handleAdminBots(w http.ResponseWriter, r *http.Request) {
+	var rep botReport
+	if !decodeJSON(w, r, &rep) {
+		return
+	}
+	s.botMu.Lock()
+	s.bot = &rep
+	s.botMu.Unlock()
+	w.WriteHeader(http.StatusNoContent)
 }

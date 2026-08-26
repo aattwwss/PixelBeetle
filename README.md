@@ -22,6 +22,20 @@ scripts/rabbitmq.sh status    # RabbitMQ (podman) — auto-started by cdc.sh
 
 Web UI: http://localhost:8080. Load test: `go build -o bin/bot ./cmd/bot && ./bin/bot -target http://localhost:8080 -rps 100`.
 
+## Fault-tolerance demo
+
+Kills one of the three TigerBeetle replicas mid-load to show that the quorum
+(3 replicas tolerate 1 failure) keeps the game serving with zero lost or
+duplicated claims, and that the cluster heals when the replica rejoins:
+
+```sh
+scripts/fault-demo.sh
+```
+
+It starts the cluster + broker + CDC, runs a bot load, `kill -9`s a follower
+replica, confirms claims still succeed while it's down, restarts the replica,
+and prints a PASSED transcript.
+
 ## Layout
 
 ```

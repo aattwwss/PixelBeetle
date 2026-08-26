@@ -114,6 +114,41 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) (*Metrics, error) {
 	}
 	defer cancel()
 
+	// API mode: heartbeat live metrics to the game server every second so the
+	// dashboard can show end-to-end latency/counts alongside the server's own
+	// counters. Direct mode has no server to report to.
+	if direct == nil {
+		go func() {
+			t := time.NewTicker(time.Second)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+				}
+				p50, p99 := m.LatencyReport()
+				body, _ := json.Marshal(map[string]any{
+					"claims":    m.ClaimsStarted.Load(),
+					"confirmed": m.Confirmed.Load(),
+					"conflicts": m.LockConflicts.Load(),
+					"errors":    m.Errors.Load(),
+					"p50Ms":     p50,
+					"p99Ms":     p99,
+					"rps":       cfg.RPS,
+				})
+				req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.Target+"/admin/bots", bytes.NewReader(body))
+				if err != nil {
+					continue
+				}
+				req.Header.Set("Content-Type", "application/json")
+				if _, err := httpc.Do(req); err != nil {
+					continue // server restarting etc.; dashboard just won't update
+				}
+			}
+		}()
+	}
+
 	var wg sync.WaitGroup
 	tokens := make(chan struct{}) // global pacing: one claim per token
 

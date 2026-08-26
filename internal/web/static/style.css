@@ -24,6 +24,53 @@ h1 { font-size: 1.2rem; margin: 0; }
   cursor: crosshair;
   background: #1c1c1c;
 }
+#canvas-stack {
+  position: relative;
+  display: block;
+  line-height: 0;
+}
+
+/* live metrics dashboard (build step 6) */
+#metrics-panel {
+  display: flex;
+  align-items: center;
+  gap: 1.25rem;
+  padding: .5rem 1rem;
+  background: #161616;
+  border-top: 1px solid #2a2a2a;
+  font-size: .78rem;
+  color: #bbb;
+  white-space: nowrap;
+  overflow-x: auto;
+}
+#metrics-panel b { color: #ffd600; font-variant-numeric: tabular-nums; }
+#metrics-panel .bot { color: #7ec7ff; }
+#metrics-panel .bot b { color: #7ec7ff; }
+/* Lock overlay: sits exactly on #grid, draws yellow border boxes for pending
+   claims. pointer-events:none so clicks pass through to #grid; no pixelated
+   rendering so the strokeRect borders anti-alias smoothly. */
+#lock-overlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+/* live metrics dashboard (build step 6) */
+#metrics-panel {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1.25rem;
+  align-items: baseline;
+  padding: .5rem 1rem;
+  font-size: .75rem;
+  color: #aaa;
+  background: #151515;
+  border-top: 1px solid #333;
+  font-variant-numeric: tabular-nums;
+}
+#metrics-panel b { color: #fff; font-weight: 600; }
+#metrics-panel .bot { color: #6cb; }
+#metrics-panel .bot b { color: #7ff; }
 
 /* time-travel slider */
 #replay-bar {

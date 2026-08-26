@@ -16,12 +16,12 @@ const PALETTE = ["#ffffff", "#e4e4e4", "#888888", "#222222", "#ffb470", "#9a6324
                  "#ffd600", "#808000", "#469990", "#42d4f4", "#4363d8", "#000075", "#f032e6", "#fabed4"];
 const PALETTE_RGB = PALETTE.map(h => [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)]);
 const EMPTY_RGB = [0x1c, 0x1c, 0x1c];
-const LOCK_RGB = [0xff, 0xd6, 0x00];
 
 const pb = {};
 window.pb = pb;
 
 let canvas, ctx, cols, rows;
+let olCanvas, olCtx; // lock overlay: yellow border boxes drawn above the bitmap
 let liveBmp = null;      // Uint8Array W*H (bitmap values 0..16)
 let lockSet = new Set(); // "x,y" strings currently locked
 let scrubEvents = null;  // [{ts,x,y,c}] sorted ascending, from GET /history
@@ -38,6 +38,15 @@ function init() {
   cols = canvas.width;
   rows = canvas.height;
   liveBmp = new Uint8Array(cols * rows);
+
+  // Lock overlay: same box as #grid but at device-pixel resolution, so a
+  // cell is cellW×cellW overlay px and a strokeRect can render a border box.
+  olCanvas = document.getElementById('lock-overlay');
+  if (olCanvas) {
+    olCtx = olCanvas.getContext('2d');
+    sizeOverlay();
+    window.addEventListener('resize', () => { sizeOverlay(); renderLocks(); });
+  }
 
   // Initial state from SSR (instant first paint, no flash).
   const initEl = document.getElementById('initial-state');
@@ -116,11 +125,8 @@ async function resolveClaim(path) {
 // ---- canvas drawing (1px per cell; CSS scales up with pixelated rendering) ----
 
 function fillCell(x, y) {
-  const key = `${x},${y}`;
   const v = liveBmp[y * cols + x];
-  let rgb;
-  if (lockSet.has(key)) rgb = LOCK_RGB;
-  else rgb = v ? PALETTE_RGB[(v - 1) % 16] : EMPTY_RGB;
+  const rgb = v ? PALETTE_RGB[(v - 1) % 16] : EMPTY_RGB;
   ctx.fillStyle = `rgb(${rgb[0]},${rgb[1]},${rgb[2]})`;
   ctx.fillRect(x, y, 1, 1);
 }
@@ -135,10 +141,47 @@ function renderFull() {
     d[o] = rgb[0]; d[o + 1] = rgb[1]; d[o + 2] = rgb[2]; d[o + 3] = 255;
   }
   ctx.putImageData(img, 0, 0);
-  ctx.fillStyle = `rgb(${LOCK_RGB[0]},${LOCK_RGB[1]},${LOCK_RGB[2]})`;
+  renderLocks();
+}
+
+// ---- lock overlay (yellow border box, transparent center) ----
+// The overlay is sized to #grid's ON-SCREEN box in device pixels (not the
+// grid's cell count): sizing it cols*S × rows*S would be a ~1GB canvas for a
+// 1000×1000 grid. Border width adapts to the displayed cell size.
+
+function sizeOverlay() {
+  if (!olCanvas) return;
+  const dpr = window.devicePixelRatio || 1;
+  const r = olCanvas.getBoundingClientRect();
+  olCanvas.width = Math.max(1, Math.round(r.width * dpr));
+  olCanvas.height = Math.max(1, Math.round(r.height * dpr));
+}
+
+function cellW() {
+  return olCanvas ? olCanvas.width / cols : 0;
+}
+
+function drawLock(x, y) {
+  if (!olCtx) return;
+  const cw = cellW();
+  const lw = Math.max(1, Math.min(cw * 0.3, cw / 2));
+  olCtx.strokeStyle = '#ffd600';
+  olCtx.lineWidth = lw;
+  olCtx.strokeRect(x * cw + lw / 2, y * cw + lw / 2, cw - lw, cw - lw);
+}
+
+function clearLock(x, y) {
+  if (!olCtx) return;
+  const cw = cellW();
+  olCtx.clearRect(x * cw, y * cw, cw, cw);
+}
+
+function renderLocks() {
+  if (!olCtx) return;
+  olCtx.clearRect(0, 0, olCanvas.width, olCanvas.height);
   for (const key of lockSet) {
     const [x, y] = key.split(',').map(Number);
-    ctx.fillRect(x, y, 1, 1);
+    drawLock(x, y);
   }
 }
 
@@ -168,12 +211,14 @@ pb.render = function (bmp, deltas, lockAdds, lockRemoves, locks) {
   if (lockAdds && lockAdds !== lastLockAdds) {
     lastLockAdds = lockAdds;
     for (const [x, y] of (lockAdds || [])) lockSet.add(`${x},${y}`);
-    if (!scrubbing) for (const [x, y] of (lockAdds || [])) fillCell(x, y);
+    if (!scrubbing) for (const [x, y] of (lockAdds || [])) drawLock(x, y);
   }
   if (lockRemoves && lockRemoves !== lastLockRemoves) {
     lastLockRemoves = lockRemoves;
-    for (const [x, y] of (lockRemoves || [])) lockSet.delete(`${x},${y}`);
-    if (!scrubbing) for (const [x, y] of (lockRemoves || [])) fillCell(x, y);
+    for (const [x, y] of (lockRemoves || [])) {
+      if (!scrubbing) clearLock(x, y);
+      lockSet.delete(`${x},${y}`);
+    }
   }
 };
 
@@ -182,6 +227,7 @@ pb.render = function (bmp, deltas, lockAdds, lockRemoves, locks) {
 pb.scrub = function (tsMs) {
   if (!scrubEvents) return;
   scrubbing = true;
+  if (olCtx) olCtx.clearRect(0, 0, olCanvas.width, olCanvas.height); // history view: no lock overlays
   const idx = bisect(scrubEvents, Number(tsMs));
   const tmp = new Uint8Array(cols * rows);
   for (let i = 0; i < idx; i++) {

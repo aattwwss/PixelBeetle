@@ -115,17 +115,14 @@ previously planned custom batching layer was dropped.
 | 3 | Web UI: SSR grid + DataStar SSE | ✅ basic loop works; polish (palette picker, countdown HUD) open |
 | 4 | CDC consumer + replay service + slider UI | ✅ consumer live-verified (multi-server sync); slider UI not started |
 | 5 | Cache recovery (snapshot + catch-up on boot) | ✅ query_transfers warm-up live-verified |
-| 6 | Load gen + live dashboard | 🚧 bot binary exists; dashboard/metrics page not started |
-| 7 | Fault-tolerance demo script (kill replica mid-load) | ⬜ blocked on 6 |
+| 6 | Load gen + live dashboard | ✅ both done (2026-08-26): bot `-grid` full-canvas capable; server-side atomic counters + bot heartbeat merged into a `metrics` signal broadcast over the SSE hub every 1s; `#metrics-panel` with claims/s, confirms/s, locks, pixels, viewers, bot p50/p99/conflicts |
+| 7 | Fault-tolerance demo script (kill replica mid-load) | ✅ `scripts/fault-demo.sh` (2026-08-26): runs load, kill -9 a follower, proves claims confirm through the quorum, restarts + rejoins; kill is PID-based (avoids pkill self-match) |
 
 ### Suggested next actions
 
-1. Replay/time-travel slider UI (step 4 remainder): the CDC consumer is done;
-   the slider needs a durable event log + a `/replay?t=...` endpoint.
-2. Live metrics dashboard (step 6): bot latency histogram + TB throughput to
-   the DataStar SSE hub.
-3. Rework-or-retire docker-compose.yml (ghcr image, host networking, RabbitMQ).
-4. Fault-tolerance demo script (kill a replica mid-load).
+1. Rework-or-retire docker-compose.yml (ghcr image, host networking, RabbitMQ).
+2. Polish: palette color picker (app.js still random), HMAC-sign the player cookie.
+3. Slider `__throttle` before a 1M-pixel run.
 
 ---
 

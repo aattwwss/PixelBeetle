@@ -37,13 +37,16 @@ const (
 	paintEv eventKind = iota
 	lockEv
 	unlockEv
+	metricsEv
 )
 
-// event is one fan-out message. color is only meaningful for paintEv.
+// event is one fan-out message. color is only meaningful for paintEv; payload
+// is only meaningful for metricsEv.
 type event struct {
-	kind  eventKind
-	x, y  uint32
-	color uint8
+	kind    eventKind
+	x, y    uint32
+	color   uint8
+	payload map[string]any
 }
 
 type subscriber struct {
@@ -143,6 +146,16 @@ func (s *subscriber) run(gen *ds.ServerSentEventGenerator, snapshot SnapshotFunc
 				lockAdds = append(lockAdds, [2]uint32{ev.x, ev.y})
 			case unlockEv:
 				lockRemoves = append(lockRemoves, [2]uint32{ev.x, ev.y})
+			case metricsEv:
+				// Push any pending cell patches first, then send metrics as its
+				// own patch-signals event so the dashboard updates on its own
+				// cadence instead of being buried under paint traffic.
+				if !flush() {
+					return
+				}
+				if err := gen.MarshalAndPatchSignals(map[string]any{"metrics": ev.payload}); err != nil {
+					return // client gone
+				}
 			}
 		case <-ticker.C:
 			if !flush() {
@@ -166,6 +179,13 @@ func (h *Hub) BroadcastLock(x, y uint32) {
 // BroadcastUnlock enqueues a pending-lock overlay remove.
 func (h *Hub) BroadcastUnlock(x, y uint32) {
 	h.broadcast(event{kind: unlockEv, x: x, y: y})
+}
+
+// BroadcastMetrics enqueues a dashboard metrics snapshot to every subscriber.
+// It is sent as its own patch-signals event (never merged into the delta
+// flush), so the dashboard ticks at its own cadence.
+func (h *Hub) BroadcastMetrics(payload map[string]any) {
+	h.broadcast(event{kind: metricsEv, payload: payload})
 }
 
 func (h *Hub) broadcast(ev event) {

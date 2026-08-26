@@ -100,6 +100,7 @@ func main() {
 		log.Error("build web server", "err", err)
 		os.Exit(1)
 	}
+	webSrv.StartMetrics(context.Background()) // live dashboard over the SSE hub
 
 	log.Info("canvas clash starting", "addr", *addr, "desc", svc.Describe())
 	if err := http.ListenAndServe(*addr, webSrv.Routes()); err != nil {
