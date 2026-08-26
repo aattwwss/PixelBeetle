@@ -47,6 +47,19 @@ start() {
     exit 1
   fi
   echo "exchange '$EXCHANGE' ready (http $code)"
+
+  # Durable sink queue permanently bound to the exchange. The CDC job EXITS
+  # with NO_ROUTE if it has something to publish while no queue is bound, so
+  # there must always be at least one binding. Consumers use their own
+  # exclusive auto-delete queues and get independent fanout copies.
+  curl -4 -s -o /dev/null -X PUT \
+    "http://127.0.0.1:$HTTP_PORT/api/queues/%2F/$EXCHANGE.sink" \
+    -u guest:guest -H 'content-type: application/json' \
+    -d '{"durable":true,"auto_delete":false,"arguments":{}}'
+  curl -4 -s -o /dev/null -X POST \
+    "http://127.0.0.1:$HTTP_PORT/api/bindings/%2F/e/$EXCHANGE/q/$EXCHANGE.sink" \
+    -u guest:guest -H 'content-type: application/json' -d '{"routing_key":""}'
+  echo "sink queue '$EXCHANGE.sink' bound"
 }
 
 stop() {

@@ -71,8 +71,12 @@ Both build-order steps 4 & 5 are now done and live-verified:
 
 Ops gotchas discovered (worth knowing before the demo):
 
-- The CDC job exits on `NO_ROUTE` — start consumers (servers) BEFORE the CDC
-  job so a queue is bound when it publishes its first backlog batch.
+- The CDC job exits on `NO_ROUTE` (publish with no queue bound). Fixed on
+  2026-08-26: `scripts/dev-rabbit.sh` now declares a durable `tigerbeetle.sink`
+  queue permanently bound to the exchange (so NO_ROUTE can't happen), and
+  `scripts/run-cdc.sh` runs the job under a restart supervisor as belt-and-
+  braces. Verified: paint while no consumer is attached, later consumer still
+  receives the full backlog.
 - RabbitMQ under rootless podman hits `.erlang.cookie: eacces` unless
   `/var/lib/rabbitmq` is a host volume with permissive ownership (the script
   handles this).
