@@ -1,38 +1,41 @@
-.PHONY: help up down serve bot rabbit-up rabbit-down tb-up tb-down cdc build test fmt vet tidy
+.PHONY: help up down serve bot db-up db-down broker-up broker-down cdc-up cdc-down build test fmt vet tidy
 
 help:
-	@echo "make up        - start dependencies: TigerBeetle x3 + RabbitMQ + CDC job"
+	@echo "make up        - start dependencies: TigerBeetle cluster (db) + RabbitMQ (broker) + CDC job"
 	@echo "make serve     - run the game server in the foreground (:8080)"
-	@echo "make down      - stop everything (server included if via run-server.sh)"
+	@echo "make down      - stop everything"
 	@echo "make bot RPS=100 DURATION=30s [PLAYERS=64] - run load generator"
-	@echo "make tb-up / tb-down      - just the TigerBeetle cluster"
-	@echo "make rabbit-up / rabbit-down - just RabbitMQ + exchange + sink queue"
+	@echo "make db-up / db-down          - just the TigerBeetle 3-replica cluster"
+	@echo "make broker-up / broker-down  - just RabbitMQ + its exchange/sink topology"
+	@echo "make cdc-up / cdc-down        - just the supervised tigerbeetle amqp job"
 	@echo "make build test fmt vet tidy"
 
 ## -- dependencies -----------------------------------------------------------
 
-up: tb-up rabbit-up
-	./scripts/run-cdc.sh start
+up: db-up broker-up cdc-up
 
 down:
-	-./scripts/run-cdc.sh stop
-	-./scripts/dev-rabbit.sh stop
-	-./scripts/dev-cluster.sh stop
+	-./scripts/cdc.sh stop
+	-./scripts/rabbitmq.sh stop
+	-./scripts/tigerbeetle.sh stop
 
-tb-up:
-	./scripts/dev-cluster.sh start
+db-up:
+	./scripts/tigerbeetle.sh start
 
-tb-down:
-	./scripts/dev-cluster.sh stop
+db-down:
+	./scripts/tigerbeetle.sh stop
 
-rabbit-up:
-	./scripts/dev-rabbit.sh start
+broker-up:
+	./scripts/rabbitmq.sh start
 
-rabbit-down:
-	./scripts/dev-rabbit.sh stop
+broker-down:
+	./scripts/rabbitmq.sh stop
 
-cdc:
-	./scripts/run-cdc.sh start
+cdc-up:
+	./scripts/cdc.sh start
+
+cdc-down:
+	./scripts/cdc.sh stop
 
 ## -- application -------------------------------------------------------------
 

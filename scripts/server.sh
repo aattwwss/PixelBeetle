@@ -13,7 +13,7 @@ case "${1:-start}" in
   start)
     mkdir -p data/logs
     if pgrep -f "bin/server " >/dev/null; then echo "server already running"; exit 0; fi
-    "${0%/*}/dev-cluster.sh" start >/dev/null
+    "${0%/*}/tigerbeetle.sh" start >/dev/null
     go build -o bin/server ./cmd/server || exit 1
     setsid nohup ./bin/server -tb-addresses "$TB" -addr :8080 \
       -cdc-url "amqp://guest:guest@127.0.0.1:5672/" -cdc-exchange tigerbeetle \
@@ -28,6 +28,6 @@ case "${1:-start}" in
     "$0" stop; sleep 1; "$0" start
     ;;
   *)
-    echo "usage: run-server.sh {build|start|stop|restart}"; exit 1
+    echo "usage: server.sh {build|start|stop|restart}"; exit 1
     ;;
 esac

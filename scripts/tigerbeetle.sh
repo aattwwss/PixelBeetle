@@ -21,7 +21,7 @@ case "${1:-start}" in
     ;;
   start)
     mkdir -p data/logs
-    ./scripts/dev-cluster.sh format >/dev/null
+    ./scripts/tigerbeetle.sh format >/dev/null
     for i in $(seq 0 $((REPLICA_COUNT-1))); do
       if pgrep -f "tigerbeetle start.*dev_$i" >/dev/null; then
         echo "replica$i already running"; continue
@@ -38,6 +38,6 @@ case "${1:-start}" in
     pgrep -fa "tigerbeetle start" | sed 's/--addresses=[^ ]*//' || echo "not running"
     ;;
   *)
-    echo "usage: dev-cluster.sh {format|start|stop|status}"; exit 1
+    echo "usage: tigerbeetle.sh {format|start|stop|status}"; exit 1
     ;;
 esac

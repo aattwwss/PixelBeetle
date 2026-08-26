@@ -45,7 +45,7 @@ type Sink interface {
 
 type Config struct {
 	AMQPURL  string // amqp://guest:guest@localhost:5672/
-	Exchange string // must pre-exist (declared by scripts/dev-rabbit.sh)
+	Exchange string // must pre-exist (declared by scripts/rabbitmq.sh)
 	Queue    string // optional; empty uses a server-named queue
 	Log      *slog.Logger
 }

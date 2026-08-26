@@ -10,7 +10,7 @@ in gameplay that makes those features *visible*.
 ## 0. Progress tracker
 
 _Updated: 2026-08-26._ Repo: `github.com/aattwwss/PixelBeetle`. Run instructions:
-`scripts/dev-cluster.sh start` (TB ×3 native) then `scripts/run-server.sh start`
+`scripts/tigerbeetle.sh start` (TB ×3 native) then `scripts/server.sh start`
 (see README).
 
 ### Done ✅
@@ -18,7 +18,7 @@ _Updated: 2026-08-26._ Repo: `github.com/aattwwss/PixelBeetle`. Run instructions
 - **Project scaffold**: Go module, `cmd/server` + `cmd/bot`, packages
   `internal/{tbclient,game,hub,web,canvas,bot,replay}`; builds clean (`go vet`).
 - **Infra (dev)**: native TigerBeetle v0.17.9 cluster, 3 replicas on
-  `127.0.0.1:3000-3002` via `scripts/dev-cluster.sh` (start/stop/status/format).
+  `127.0.0.1:3000-3002` via `scripts/tigerbeetle.sh` (start/stop/status/format).
   *Deviation from §6*: docs explicitly discourage running TB in Docker; image
   lives on ghcr.io (not Docker Hub) and multi-replica compose requires host
   networking (TB validates replica addresses, rejects DNS names). The old
@@ -63,8 +63,8 @@ Both build-order steps 4 & 5 are now done and live-verified:
   accepted as decimal strings *or* bare numbers), dedupes by transfer id, and
   applies posted claims via `game.Service.ApplyEvent` (idempotent: no-op on
   the originating instance, paint+broadcast on a second instance).
-- **RabbitMQ dev**: `scripts/dev-rabbit.sh` (podman, declares the durable
-  fanout `tigerbeetle` exchange) and `scripts/run-cdc.sh` (native
+- **RabbitMQ dev**: `scripts/rabbitmq.sh` (podman, declares the durable
+  fanout `tigerbeetle` exchange) and `scripts/cdc.sh` (native
   `tigerbeetle amqp` job).
 - **Multi-server sync verified**: ran a second server on :8081 with `-cdc-url`;
   painted on :8080; :8081 caught up via CDC alone (no direct claim).
@@ -72,9 +72,9 @@ Both build-order steps 4 & 5 are now done and live-verified:
 Ops gotchas discovered (worth knowing before the demo):
 
 - The CDC job exits on `NO_ROUTE` (publish with no queue bound). Fixed on
-  2026-08-26: `scripts/dev-rabbit.sh` now declares a durable `tigerbeetle.sink`
+  2026-08-26: `scripts/rabbitmq.sh` now declares a durable `tigerbeetle.sink`
   queue permanently bound to the exchange (so NO_ROUTE can't happen), and
-  `scripts/run-cdc.sh` runs the job under a restart supervisor as belt-and-
+  `scripts/cdc.sh` runs the job under a restart supervisor as belt-and-
   braces. Verified: paint while no consumer is attached, later consumer still
   receives the full backlog.
 - RabbitMQ under rootless podman hits `.erlang.cookie: eacces` unless

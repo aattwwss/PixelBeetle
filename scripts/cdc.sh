@@ -22,7 +22,7 @@ case "${1:-start}" in
   start)
     mkdir -p data/logs
     if pgrep -f "pb-cdc-supervisor" >/dev/null; then echo "cdc already running"; exit 0; fi
-    ./scripts/dev-rabbit.sh start >/dev/null || exit 1
+    ./scripts/rabbitmq.sh start >/dev/null || exit 1
     setsid nohup bash -c "$SUPERVISOR" >/dev/null 2>&1 &
     sleep 3
     if pgrep -f "pb-cdc-supervisor" >/dev/null; then
@@ -44,6 +44,6 @@ case "${1:-start}" in
     pgrep -af "pb-cdc-supervisor|bin/tigerbeetle amqp" || echo "not running"
     ;;
   *)
-    echo "usage: run-cdc.sh {start|stop|status}"; exit 1
+    echo "usage: cdc.sh {start|stop|status}"; exit 1
     ;;
 esac

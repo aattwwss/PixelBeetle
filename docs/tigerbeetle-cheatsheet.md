@@ -155,7 +155,7 @@ code filter + timestamp ranges.
 
 ## Ops notes
 
-- Native binaries preferred over Docker (see scripts/dev-cluster.sh).
+- Native binaries preferred over Docker (see scripts/tigerbeetle.sh).
 - 3 replicas tolerate 1 failure (quorum 2f+1).
 - CDC (`tigerbeetle amqp ...`) emits two_phase_pending/posted/voided/expired;
   body carries full transfer + point-in-time balances; use body timestamp
