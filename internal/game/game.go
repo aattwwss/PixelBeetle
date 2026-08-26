@@ -256,6 +256,7 @@ func (s *Service) ApplyEvent(ev replay.Event) {
 func (s *Service) ReapExpired() {
 	now := time.Now()
 	n := 0
+	var unlocked [][2]uint32 // reaped cells to broadcast after releasing mu
 	s.mu.Lock()
 	for k, l := range s.locks {
 		if now.After(l.expires) {
@@ -268,9 +269,15 @@ func (s *Service) ReapExpired() {
 			}
 			delete(s.locks, k)
 			n++
+			// Broadcast so clients stop rendering the cell as locked — without
+			// this an expired claim stays visually stuck until someone repaints it.
+			unlocked = append(unlocked, [2]uint32{uint32(k >> 32), uint32(k & 0xffffffff)})
 		}
 	}
 	s.mu.Unlock()
+	for _, c := range unlocked {
+		s.hub.PixelUnlocked(c[0], c[1])
+	}
 	if n > 0 {
 		s.log.Debug("reaped expired locks", "count", n)
 	}
