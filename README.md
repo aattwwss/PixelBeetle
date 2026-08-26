@@ -8,7 +8,19 @@ Built to showcase two-phase transfers, idempotency, immutable history, CDC, and 
 
 ## Status
 
-🚧 Scaffolding in progress. See plan.md §7 for the build order.
+Core loop + DB-enforced exclusivity + warm-up + CDC are done and live-verified.
+See plan.md §0 for the full progress tracker.
+
+## Run (dev, all-native)
+
+```sh
+scripts/dev-cluster.sh start    # TigerBeetle ×3 on :3000-3002
+scripts/run-server.sh start     # game server on :8080 (+ warm-up + CDC)
+scripts/run-cdc.sh start        # tigerbeetle amqp CDC job → RabbitMQ
+scripts/dev-rabbit.sh status    # RabbitMQ (podman) — auto-started by run-cdc
+```
+
+Web UI: http://localhost:8080. Load test: `go build -o bin/bot ./cmd/bot && ./bin/bot -target http://localhost:8080 -rps 100`.
 
 ## Layout
 
@@ -19,6 +31,8 @@ internal/tbclient  TigerBeetle wrapper + claim construction (shared by server & 
 internal/game      pixel cache, lock table, claim service
 internal/hub       DataStar SSE broadcast hub
 internal/web       SSR handlers + templates
-internal/replay    CDC consumer (replay/time-travel)
+internal/replay    CDC consumer (AMQP parsing + dedupe)
+internal/warm      boot-time cache rebuild from query_transfers
+scripts/           dev-cluster, run-server, run-cdc, dev-rabbit
 web/static         static assets (incl. vendored datastar.js)
 ```

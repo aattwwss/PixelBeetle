@@ -14,7 +14,9 @@ import (
 	tb "github.com/tigerbeetle/tigerbeetle-go"
 
 	"pixelbeetle/internal/hub"
+	"pixelbeetle/internal/replay"
 	"pixelbeetle/internal/tbclient"
+	"pixelbeetle/internal/warm"
 )
 
 var (
@@ -211,6 +213,42 @@ func (s *Service) Snapshot() map[uint64]Pixel {
 
 // Grid returns the canvas dimensions.
 func (s *Service) Grid() (uint32, uint32) { return s.gridW, s.gridH }
+
+// WarmCache rebuilds the pixel cache from TigerBeetle transfer history so a
+// restarted server shows the canvas instead of a blank grid.
+func (s *Service) WarmCache() error {
+	pixels, err := warm.Scan(s.tb, s.gridW, s.gridH, s.log)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	for _, p := range pixels {
+		s.pixels[pack(p.X, p.Y)] = Pixel{Color: p.Color, Version: p.Version}
+	}
+	s.mu.Unlock()
+	s.log.Info("warmed pixel cache", "count", len(pixels))
+	return nil
+}
+
+// ApplyEvent ingests a CDC event (replay.Sink). It only reacts to posted
+// claims, painting the cell if its color changed — which makes it idempotent
+// on the instance that originated the claim (same color ⇒ no-op) and correct
+// on a second instance consuming the stream (stale color ⇒ paint + broadcast).
+func (s *Service) ApplyEvent(ev replay.Event) {
+	if ev.Type != replay.TypePosted {
+		return
+	}
+	key := pack(ev.X, ev.Y)
+	s.mu.Lock()
+	cur, ok := s.pixels[key]
+	if ok && cur.Color == ev.Color {
+		s.mu.Unlock()
+		return
+	}
+	s.pixels[key] = Pixel{Color: ev.Color, Version: cur.Version + 1}
+	s.mu.Unlock()
+	s.hub.PixelPainted(ev.X, ev.Y, ev.Color)
+}
 
 // ReapExpired drops stale in-memory locks. TigerBeetle auto-expires the
 // underlying pending transfers (emitting two_phase_expired over CDC), so this

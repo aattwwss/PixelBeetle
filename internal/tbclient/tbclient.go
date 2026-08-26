@@ -4,6 +4,7 @@
 package tbclient
 
 import (
+	"encoding/binary"
 	"fmt"
 
 	"github.com/google/uuid"
@@ -27,6 +28,15 @@ const (
 // SystemPoolID is the fixed dummy debit-side account.
 var SystemPoolID = tb.ToUint128(1)
 
+// PixelIDMarker occupies the high 64 bits of every pixel account id, putting
+// pixel accounts in a dedicated 128-bit namespace. This guarantees pixel ids
+// are never zero (TB rejects zero) and never collide with SystemPoolID (1).
+const PixelIDMarker uint64 = 1
+
+// fundMarker occupies the high 64 bits of the deterministic fund-transfer id,
+// keeping it distinct from UUIDv7 claim ids and from pixel account ids.
+const fundMarker uint64 = 0xF00D
+
 // ErrPixelLocked means TigerBeetle itself rejected the claim because the
 // pixel's claimable unit is already reserved by a pending transfer.
 var ErrPixelLocked = fmt.Errorf("pixel already claimed")
@@ -45,9 +55,23 @@ func Connect(clusterID uint64, addresses []string) (*Client, error) {
 
 func (c *Client) Close() { c.tb.Close() }
 
-// PixelID packs (x, y) into a stable TigerBeetle account id.
+// PixelID packs (x, y) into a stable TigerBeetle account id. The pixel's
+// coordinates live in the low 64 bits; the high 64 bits are PixelIDMarker.
 func PixelID(x, y uint32) tb.Uint128 {
-	return tb.ToUint128(uint64(x)<<32 | uint64(y))
+	var b [16]byte
+	binary.LittleEndian.PutUint64(b[0:8], uint64(x)<<32|uint64(y))
+	binary.LittleEndian.PutUint64(b[8:16], PixelIDMarker)
+	return tb.BytesToUint128(b)
+}
+
+// UnpackPixelID recovers (x, y) from a PixelID. ok is false if the id's high
+// bits aren't PixelIDMarker (i.e., it is not a pixel account id).
+func UnpackPixelID(id tb.Uint128) (x, y uint32, ok bool) {
+	lo, hi := id.Uint64()
+	if hi != PixelIDMarker {
+		return 0, 0, false
+	}
+	return uint32(lo >> 32), uint32(lo & 0xffffffff), true
 }
 
 // EnsureAccounts idempotently creates the system pool plus any pixel accounts.
@@ -85,11 +109,8 @@ func (c *Client) EnsureAccounts(pixelIDs ...tb.Uint128) error {
 // stable id makes funding idempotent across server restarts (exists == ok).
 func FundID(x, y uint32) tb.Uint128 {
 	var b [16]byte
-	key := uint64(x)<<32 | uint64(y)
-	b[0] = 0xF0 // marker byte: distinguishes fund ids from UUIDv7 claim ids
-	for i := 0; i < 8; i++ {
-		b[8+i] = byte(key >> (8 * (7 - i)))
-	}
+	binary.LittleEndian.PutUint64(b[0:8], uint64(x)<<32|uint64(y))
+	binary.LittleEndian.PutUint64(b[8:16], fundMarker)
 	return tb.BytesToUint128(b)
 }
 
@@ -212,4 +233,18 @@ func Uint128ToUUID(v tb.Uint128) uuid.UUID {
 	b := v.Bytes()
 	u, _ := uuid.FromBytes(b[:])
 	return u
+}
+
+// QueryCanvasTransfers returns canvas-ledger transfers with a timestamp at or
+// after fromTimestamp, ascending. Used for boot-time cache warm-up.
+func (c *Client) QueryCanvasTransfers(fromTimestamp uint64, limit uint32) ([]tb.Transfer, error) {
+	transfers, err := c.tb.QueryTransfers(tb.QueryFilter{
+		Ledger:       LedgerCanvas,
+		TimestampMin: fromTimestamp,
+		Limit:        limit,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("tbclient: query_transfers: %w", err)
+	}
+	return transfers, nil
 }

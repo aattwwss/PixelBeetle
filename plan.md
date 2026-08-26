@@ -42,17 +42,45 @@ _Updated: 2026-08-26._ Repo: `github.com/aattwwss/PixelBeetle`. Run instructions
 
 ### Known gaps 🚧
 
-- **Cold start**: pixel cache is process-local — restarting the server shows an
-  empty canvas even though TB holds all state. Fix = build-order step 5
-  (boot-time catch-up via CDC or query_transfers). Interim workaround: none.
 - **docker-compose.yml stale**: wrong registry (`tigerbeetle/tigerbeetle` on
   Docker Hub no longer exists → use `ghcr.io/tigerbeetle/tigerbeetle`),
   service-name addressing won't pass TB validation (host networking needed),
   and this machine runs podman(-compose) where `make up` hangs. Either rework
   for ghcr + host networking or deprecate compose in favor of the native
   scripts + a single RabbitMQ container.
-- **CDC/replay**: `internal/replay` is a typed stub (`ErrNotImplemented`);
-  RabbitMQ not provisioned yet.
+
+### Boot-time warm-up + CDC consumer (2026-08-26) ✅
+
+Both build-order steps 4 & 5 are now done and live-verified:
+
+- **Warm-up** (`internal/warm`, `-warmup` flag, default on): pages through
+  `query_transfers` (ledger=1, ascending, `TimestampMin` inclusive) and folds
+  posted claim legs (`Flags & 0x4`) into the pixel cache. A restart now
+  restores the canvas — verified: painted (0,0)/(0,1)/(10,20), restarted,
+  `pixels=3` and all cells re-render.
+- **CDC consumer** (`internal/replay`, `-cdc-url` flag): consumes the
+  `tigerbeetle amqp` stream over RabbitMQ, parses the CDC JSON body (u128/u64
+  accepted as decimal strings *or* bare numbers), dedupes by transfer id, and
+  applies posted claims via `game.Service.ApplyEvent` (idempotent: no-op on
+  the originating instance, paint+broadcast on a second instance).
+- **RabbitMQ dev**: `scripts/dev-rabbit.sh` (podman, declares the durable
+  fanout `tigerbeetle` exchange) and `scripts/run-cdc.sh` (native
+  `tigerbeetle amqp` job).
+- **Multi-server sync verified**: ran a second server on :8081 with `-cdc-url`;
+  painted on :8080; :8081 caught up via CDC alone (no direct claim).
+
+Ops gotchas discovered (worth knowing before the demo):
+
+- The CDC job exits on `NO_ROUTE` — start consumers (servers) BEFORE the CDC
+  job so a queue is bound when it publishes its first backlog batch.
+- RabbitMQ under rootless podman hits `.erlang.cookie: eacces` unless
+  `/var/lib/rabbitmq` is a host volume with permissive ownership (the script
+  handles this).
+- Management API must be reached via `127.0.0.1`, not `localhost` (podman's
+  passt only forwards IPv4; curl otherwise tries `::1` and gets a reset).
+- Pixel ids moved into a dedicated 128-bit namespace (`PixelIDMarker` in the
+  high 64 bits) — the old `x<<32|y` scheme collided with `SystemPoolID` (1)
+  and with the illegal zero id, breaking paints on (0,0) and (0,1).
 
 ### Core model v2: DB-enforced exclusivity (2026-08-26) ✅
 
@@ -78,23 +106,22 @@ previously planned custom batching layer was dropped.
 
 | # | Step | Status |
 |---|------|--------|
-| 1 | Infra: TB ×3 (+ RabbitMQ) | ✅ TB native scripts; 🚧 RabbitMQ + CDC job pending; compose stale |
+| 1 | Infra: TB ×3 (+ RabbitMQ) | ✅ TB native scripts + RabbitMQ podman script; compose stale |
 | 2 | Core server: accounts, pending→post/void, locks, cache | ✅ done; v2 model puts exclusivity inside TB |
 | 3 | Web UI: SSR grid + DataStar SSE | ✅ basic loop works; polish (palette picker, countdown HUD) open |
-| 4 | CDC consumer + replay service + slider UI | ⬜ not started |
-| 5 | Cache recovery (snapshot + catch-up on boot) | ⬜ not started — blocks restart demos |
+| 4 | CDC consumer + replay service + slider UI | ✅ consumer live-verified (multi-server sync); slider UI not started |
+| 5 | Cache recovery (snapshot + catch-up on boot) | ✅ query_transfers warm-up live-verified |
 | 6 | Load gen + live dashboard | 🚧 bot binary exists; dashboard/metrics page not started |
-| 7 | Fault-tolerance demo script (kill replica mid-load) | ⬜ blocked on 4–6 |
+| 7 | Fault-tolerance demo script (kill replica mid-load) | ⬜ blocked on 6 |
 
 ### Suggested next actions
 
-1. Provision RabbitMQ (single podman container is enough) + run
-   `tigerbeetle amqp` CDC job; implement the replay consumer (step 4).
-2. Boot-time cache catch-up: either consume CDC from timestamp 0 (showcases
-   CDC) or `query_filter` range scan (simpler) — decide when building step 5.
+1. Replay/time-travel slider UI (step 4 remainder): the CDC consumer is done;
+   the slider needs a durable event log + a `/replay?t=...` endpoint.
+2. Live metrics dashboard (step 6): bot latency histogram + TB throughput to
+   the DataStar SSE hub.
 3. Rework-or-retire docker-compose.yml (ghcr image, host networking, RabbitMQ).
-4. Measure whether client auto-batching suffices under load before adding any
-   explicit batching (see docs/tigerbeetle-cheatsheet.md).
+4. Fault-tolerance demo script (kill a replica mid-load).
 
 ---
 

@@ -15,7 +15,9 @@ case "${1:-start}" in
     if pgrep -f "bin/server " >/dev/null; then echo "server already running"; exit 0; fi
     "${0%/*}/dev-cluster.sh" start >/dev/null
     go build -o bin/server ./cmd/server || exit 1
-    setsid nohup ./bin/server -tb-addresses "$TB" -addr :8080 > data/logs/server.log 2>&1 &
+    setsid nohup ./bin/server -tb-addresses "$TB" -addr :8080 \
+      -cdc-url "amqp://guest:guest@127.0.0.1:5672/" -cdc-exchange tigerbeetle \
+      > data/logs/server.log 2>&1 &
     sleep 2
     curl -s http://localhost:8080/healthz && echo " <- server up"
     ;;
