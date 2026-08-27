@@ -29,6 +29,7 @@ func main() {
 		eager       = flag.Bool("eager", true, "create+fund all pixel accounts at startup (N accounts before the first paint)")
 		cdcURL      = flag.String("cdc-url", "", "AMQP URL for the TigerBeetle CDC stream (empty = disabled), e.g. amqp://guest:guest@localhost:5672/")
 		cdcExchange = flag.String("cdc-exchange", "tigerbeetle", "AMQP exchange the CDC job publishes to")
+		secret      = flag.String("secret", "pixelbeetle-demo-secret-change-me", "HMAC key signing the player_id cookie")
 	)
 	flag.Parse()
 
@@ -95,7 +96,7 @@ func main() {
 		}()
 	}
 
-	webSrv, err := web.New(svc, h, log)
+	webSrv, err := web.New(svc, h, log, *secret)
 	if err != nil {
 		log.Error("build web server", "err", err)
 		os.Exit(1)

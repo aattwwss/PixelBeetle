@@ -287,14 +287,18 @@ func (s *Service) TransferTimeRange() (uint64, uint64) {
 // restarted server shows the canvas instead of a blank grid.
 func (s *Service) WarmCache() error {
 	const limit = 4000
+	start := time.Now()
+	s.log.Info("warmup starting: replaying canvas history from TigerBeetle")
 	seen := make(map[uint64]Pixel)
 	var history []PaintEvent
 	var from uint64
-	for {
+	var scanned uint64
+	for pageIdx := 0; ; pageIdx++ {
 		page, err := s.tb.QueryCanvasTransfers(from, limit)
 		if err != nil {
 			return err
 		}
+		scanned += uint64(len(page))
 		for _, t := range page {
 			x, y, color, ok := warm.PostedClaim(t, s.gridW, s.gridH)
 			if !ok {
@@ -304,6 +308,12 @@ func (s *Service) WarmCache() error {
 			prev := seen[key]
 			seen[key] = Pixel{Color: color, Version: prev.Version + 1}
 			history = append(history, PaintEvent{TsMs: int64(t.Timestamp / 1_000_000), X: x, Y: y, Color: color})
+		}
+		// Progress every ~40k transfers (~10 pages of 4000), so a large
+		// ledger (bot runs push millions of transfers) shows the server is
+		// alive instead of looking hung.
+		if pageIdx > 0 && pageIdx%10 == 0 {
+			s.log.Info("warming up", "page", pageIdx, "scanned", scanned, "pixels", len(seen))
 		}
 		if len(page) < limit {
 			break
@@ -316,7 +326,7 @@ func (s *Service) WarmCache() error {
 	}
 	s.history = history
 	s.mu.Unlock()
-	s.log.Info("warmed pixel cache", "pixels", len(seen), "history", len(history))
+	s.log.Info("warmup complete", "scanned", scanned, "pixels", len(seen), "elapsed", time.Since(start).Round(time.Millisecond))
 	return nil
 }
 

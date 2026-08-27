@@ -21,8 +21,8 @@ _Updated: 2026-08-26._ Repo: `github.com/aattwwss/PixelBeetle`. Run instructions
   `127.0.0.1:3000-3002` via `scripts/tigerbeetle.sh` (start/stop/status/format).
   *Deviation from §6*: docs explicitly discourage running TB in Docker; image
   lives on ghcr.io (not Docker Hub) and multi-replica compose requires host
-  networking (TB validates replica addresses, rejects DNS names). The old
-  docker-compose.yml is stale — see TODO below.
+  networking (TB validates replica addresses, rejects DNS names).
+  docker-compose.yml is reworked for this (2026-08-27) — see Known gaps.
 - **Core server**: full two-phase claim flow working end-to-end against the live
   cluster:
   - claim → pending transfer (UUIDv7 id, amount=1, code=`TransferCodeClaim|color`,
@@ -42,12 +42,13 @@ _Updated: 2026-08-26._ Repo: `github.com/aattwwss/PixelBeetle`. Run instructions
 
 ### Known gaps 🚧
 
-- **docker-compose.yml stale**: wrong registry (`tigerbeetle/tigerbeetle` on
-  Docker Hub no longer exists → use `ghcr.io/tigerbeetle/tigerbeetle`),
-  service-name addressing won't pass TB validation (host networking needed),
-  and this machine runs podman(-compose) where `make up` hangs. Either rework
-  for ghcr + host networking or deprecate compose in favor of the native
-  scripts + a single RabbitMQ container.
+- **docker-compose.yml reworked** (2026-08-27): now a correct deployable spec —
+  `ghcr.io/tigerbeetle/tigerbeetle:0.17.9` (not Docker Hub), `network_mode: host`
+  on every service (TB validates replica addresses and refuses DNS names),
+  format-if-missing start commands matching `scripts/tigerbeetle.sh`, RabbitMQ
+  with a host volume for `/var/lib/rabbitmq` (rootless-podman `.erlang.cookie`
+  fix). Dev on this machine still uses the native scripts (`make up`); the
+  compose file targets environments with a real Docker daemon.
 
 ### Boot-time warm-up + CDC consumer (2026-08-26) ✅
 
@@ -120,9 +121,11 @@ previously planned custom batching layer was dropped.
 
 ### Suggested next actions
 
-1. Rework-or-retire docker-compose.yml (ghcr image, host networking, RabbitMQ).
+1. ~~Rework-or-retire docker-compose.yml~~ ✅ done (2026-08-27): ghcr image,
+   host networking, RabbitMQ host volume. Remaining polish:
 2. Polish: palette color picker (app.js still random), HMAC-sign the player cookie.
 3. Slider `__throttle` before a 1M-pixel run.
+4. Warmup progress logging (large ledgers make `WarmCache` look hung).
 
 ---
 

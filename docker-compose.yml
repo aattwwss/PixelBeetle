@@ -1,20 +1,37 @@
+# PixelBeetle infra for environments WITH a real Docker daemon (deployment).
+#
+# For local dev, prefer `make up` (native binaries). On the dev machine there
+# is no real Docker daemon (docker is a podman symlink, both inactive), so
+# `docker compose` hangs — this file is a deployable spec, kept in sync with
+# the native setup in scripts/{tigerbeetle,rabbitmq,cdc}.sh.
+#
+# Multi-node TigerBeetle REQUIRES network_mode: host: TB validates the replica
+# addresses in --addresses and refuses custom DNS/domain names (service names
+# like tigerbeetle-0:3000 fail address validation). All services therefore
+# share the host network — no `ports:` mapping is needed; TB binds :3000-3002
+# and RabbitMQ binds :5672/:15672 directly on the host.
 name: pixelbeetle
 
 services:
   rabbitmq:
     image: rabbitmq:3-management
-    ports:
-      - "5672:5672"    # AMQP
-      - "15672:15672"  # management UI (guest/guest)
+    network_mode: host
+    # Rootless podman hits a .erlang.cookie eacces unless the data dir is a
+    # host volume. First start: chown the dir to the image user:
+    #   sudo mkdir -p ~/.pixelbeetle-rabbitmq && sudo chown 999:999 ~/.pixelbeetle-rabbitmq
+    volumes:
+      - ~/.pixelbeetle-rabbitmq:/var/lib/rabbitmq
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
       interval: 3s
       timeout: 5s
       retries: 20
 
-  # CDC publishes to a pre-existing exchange — declare it before starting the job.
+  # CDC publishes to a pre-existing exchange — declare it before the job starts
+  # (the amqp job exits with NO_ROUTE if it has a backlog and nothing is bound).
   rabbitmq-init:
     image: curlimages/curl
+    network_mode: host
     depends_on:
       rabbitmq:
         condition: service_healthy
@@ -23,58 +40,72 @@ services:
       - guest:guest
       - -X
       - PUT
-      - http://rabbitmq:15672/api/exchanges/%2F/tigerbeetle
+      - http://127.0.0.1:15672/api/exchanges/%2F/tigerbeetle
       - -H
       - content-type:application/json
       - -d
       - '{"type":"fanout","auto_delete":false,"durable":true}'
+    restart: "no"
+
+  # The game server itself is NOT containerized in the demo — run it on the
+  # host (`make serve`) pointing at these addresses.
 
   tigerbeetle-0:
-    image: tigerbeetle/tigerbeetle:0.17.9
-    command: sh -c "test -f /data/dev_0.tigerbeetle || ./tigerbeetle format --cluster=0 --replica=0 --replica-count=3 /data/dev_0.tigerbeetle; exec ./tigerbeetle start --addresses=0.0.0.0:3000 /data/dev_0.tigerbeetle"
-    ports:
-      - "3000:3000"
+    image: ghcr.io/tigerbeetle/tigerbeetle:0.17.9
+    network_mode: host
+    # format-if-missing then start; --addresses must be the full 3-element
+    # cluster list, index-matched per replica (same as scripts/tigerbeetle.sh).
+    command: sh -c "test -f /data/dev_0.tigerbeetle || ./tigerbeetle format --cluster=0 --replica=0 --replica-count=3 /data/dev_0.tigerbeetle; exec ./tigerbeetle start --addresses=127.0.0.1:3000,127.0.0.1:3001,127.0.0.1:3002 /data/dev_0.tigerbeetle"
     volumes:
       - tb0:/data
     healthcheck:
-      test: ["CMD-SHELL", "./tigerbeetle start --addresses=tigerbeetle-1:3000,tigerbeetle-2:3000 /dev/null || true"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-      disabled: true # v1 scaffold: rely on client connect errors instead
+      # TB has no health endpoint; rely on the server's client errors instead.
+      test: ["CMD-SHELL", "exit 0"]
+      interval: 1m
+      timeout: 1s
+      retries: 1
+      start_period: 0s
+      disabled: true
 
   tigerbeetle-1:
-    image: tigerbeetle/tigerbeetle:0.17.9
-    command: sh -c "test -f /data/dev_1.tigerbeetle || ./tigerbeetle format --cluster=0 --replica=1 --replica-count=3 /data/dev_1.tigerbeetle; exec ./tigerbeetle start --addresses=0.0.0.0:3000 /data/dev_1.tigerbeetle"
-    ports:
-      - "3001:3000"
+    image: ghcr.io/tigerbeetle/tigerbeetle:0.17.9
+    network_mode: host
+    command: sh -c "test -f /data/dev_1.tigerbeetle || ./tigerbeetle format --cluster=0 --replica=1 --replica-count=3 /data/dev_1.tigerbeetle; exec ./tigerbeetle start --addresses=127.0.0.1:3000,127.0.0.1:3001,127.0.0.1:3002 /data/dev_1.tigerbeetle"
     volumes:
       - tb1:/data
+    healthcheck:
+      disabled: true
 
   tigerbeetle-2:
-    image: tigerbeetle/tigerbeetle:0.17.9
-    command: sh -c "test -f /data/dev_2.tigerbeetle || ./tigerbeetle format --cluster=0 --replica=2 --replica-count=3 /data/dev_2.tigerbeetle; exec ./tigerbeetle start --addresses=0.0.0.0:3000 /data/dev_2.tigerbeetle"
-    ports:
-      - "3002:3000"
+    image: ghcr.io/tigerbeetle/tigerbeetle:0.17.9
+    network_mode: host
+    command: sh -c "test -f /data/dev_2.tigerbeetle || ./tigerbeetle format --cluster=0 --replica=2 --replica-count=3 /data/dev_2.tigerbeetle; exec ./tigerbeetle start --addresses=127.0.0.1:3000,127.0.0.1:3001,127.0.0.1:3002 /data/dev_2.tigerbeetle"
     volumes:
       - tb2:/data
+    healthcheck:
+      disabled: true
 
   cdc:
-    image: tigerbeetle/tigerbeetle:0.17.9
+    image: ghcr.io/tigerbeetle/tigerbeetle:0.17.9
+    network_mode: host
     depends_on:
       rabbitmq-init:
         condition: service_completed_successfully
     command:
       - ./tigerbeetle
       - amqp
-      - --addresses=tigerbeetle-0:3000,tigerbeetle-1:3000,tigerbeetle-2:3000
+      - --addresses=127.0.0.1:3000,127.0.0.1:3001,127.0.0.1:3002
       - --cluster=0
-      - --host=rabbitmq
+      - --host=127.0.0.1
       - --vhost=/
       - --user=guest
       - --password=guest
       - --publish-exchange=tigerbeetle
     restart: unless-stopped # single-instance job; monitor & restart per docs
+    # Caveat: the amqp CDC subcommand is only in builds linked against the
+    # RabbitMQ client libs (our native 0.17.9+cc1c06a binary has it). If the
+    # ghcr image lacks `tigerbeetle amqp`, run scripts/cdc.sh as a host
+    # process against 127.0.0.1:3000-3002 instead and skip this service.
 
 volumes:
   tb0:

@@ -2,12 +2,15 @@ package web
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"embed"
 	"encoding/hex"
 	"encoding/json"
 	"html/template"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -23,26 +26,67 @@ var indexHTML embed.FS
 
 const playerCookie = "player_id"
 
-// ---- player identity (stateless cookie for the demo) ----
-// TODO(plan): HMAC-sign before any public deployment.
+// ---- player identity (stateless cookie, HMAC-signed) ----
+//
+// The cookie value is "<uuid>-<hmac-hex>": the HMAC-SHA256 of the canonical
+// (hyphenated) UUID string under the server secret, truncated to 16 bytes so
+// the tag is 32 hex chars. A forged or tampered cookie fails verification and
+// the client is silently minted a fresh identity (ideal for a demo: players
+// appear anonymous, not broken).
+
+// signPlayer signs a UUID for use as a player_id cookie value.
+func signPlayer(secret []byte, id uuid.UUID) string {
+	return id.String() + ":" + hex.EncodeToString(hmacTag(secret, id))
+}
+
+// verifyPlayer validates a player_id cookie value, returning the UUID and true
+// on success. Any malformed or forged value returns (uuid.Nil, false).
+func verifyPlayer(secret []byte, raw string) (uuid.UUID, bool) {
+	i := strings.LastIndexByte(raw, ':')
+	if i < 0 {
+		return uuid.Nil, false
+	}
+	canonical, tagHex := raw[:i], raw[i+1:]
+	u, err := uuid.Parse(canonical)
+	if err != nil {
+		return uuid.Nil, false
+	}
+	// Recompute over the canonical form so either cookie spelling validates,
+	// and compare in constant time to avoid a timing oracle on the tag.
+	want := hex.EncodeToString(hmacTag(secret, u))
+	if !hmac.Equal([]byte(want), []byte(tagHex)) {
+		return uuid.Nil, false
+	}
+	return u, true
+}
+
+func hmacTag(secret []byte, id uuid.UUID) []byte {
+	h := hmac.New(sha256.New, secret)
+	_, _ = h.Write([]byte(id.String()))
+	return h.Sum(nil)[:16]
+}
 
 type ctxKey int
 
 const playerKey ctxKey = 0
 
-func playerFromCookie(w http.ResponseWriter, r *http.Request) uuid.UUID {
+// playerFromCookie returns the player identity for this request. A missing,
+// malformed, or forged cookie is treated as a brand-new player: a fresh UUIDv7
+// is minted and the signed cookie is set on the response.
+func (s *Server) playerFromCookie(w http.ResponseWriter, r *http.Request) uuid.UUID {
 	if c, err := r.Cookie(playerCookie); err == nil {
-		if u, err := uuid.Parse(c.Value); err == nil {
+		if u, ok := verifyPlayer(s.secret, c.Value); ok {
 			return u
 		}
 	}
 	u := uuid.Must(uuid.NewV7())
 	http.SetCookie(w, &http.Cookie{
 		Name:    playerCookie,
-		Value:   u.String(),
+		Value:   signPlayer(s.secret, u),
 		Path:    "/",
 		Expires: time.Now().Add(365 * 24 * time.Hour),
-		Secure:  false, // demo runs on localhost
+		Secure:   false,   // demo runs on localhost
+	HttpOnly: true,    // not readable from JS: defends against XSS impersonation
 	})
 	return u
 }

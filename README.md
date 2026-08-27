@@ -22,6 +22,26 @@ scripts/rabbitmq.sh status    # RabbitMQ (podman) — auto-started by cdc.sh
 
 Web UI: http://localhost:8080. Load test: `go build -o bin/bot ./cmd/bot && ./bin/bot -target http://localhost:8080 -rps 100`.
 
+## Run (deploy, Docker)
+
+`docker-compose.yml` is a deployable, corrected spec for environments with a
+real Docker daemon: TigerBeetle ×3 from `ghcr.io/tigerbeetle/tigerbeetle`
+(not Docker Hub) + RabbitMQ, all with `network_mode: host` (TigerBeetle
+refuses DNS/service-name addresses, so host networking is required).
+
+```sh
+docker compose up -d rabbitmq
+# wait for RabbitMQ healthy, then start TigerBeetle + the CDC job:
+docker compose up -d tigerbeetle-0 tigerbeetle-1 tigerbeetle-2 cdc
+# run the game server natively (or containerize it separately):
+make serve
+```
+
+First RabbitMQ start: `sudo mkdir -p ~/.pixelbeetle-rabbitmq && sudo chown 999:999 ~/.pixelbeetle-rabbitmq`
+(rootless containers hit a `.erlang.cookie` permission error otherwise).
+See comments in `docker-compose.yml` for caveats (`amqp` subcommand availability
+in the image, CDC as a host process).
+
 ## Fault-tolerance demo
 
 Kills one of the three TigerBeetle replicas mid-load to show that the quorum

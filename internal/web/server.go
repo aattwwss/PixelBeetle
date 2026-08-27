@@ -18,10 +18,11 @@ import (
 )
 
 type Server struct {
-	svc  *game.Service
-	hub  *hub.Hub
-	log  *slog.Logger
-	tmpl *templateRenderer
+	svc    *game.Service
+	hub    *hub.Hub
+	log    *slog.Logger
+	tmpl   *templateRenderer
+	secret []byte // HMAC key signing the player_id cookie
 
 	botMu sync.Mutex
 	bot   *botReport // latest bot heartbeat posted to /admin/bots
@@ -40,12 +41,12 @@ type botReport struct {
 	RPS       int     `json:"rps"`
 }
 
-func New(svc *game.Service, h *hub.Hub, log *slog.Logger) (*Server, error) {
+func New(svc *game.Service, h *hub.Hub, log *slog.Logger, secret string) (*Server, error) {
 	tr, err := newTemplateRenderer()
 	if err != nil {
 		return nil, err
 	}
-	return &Server{svc: svc, hub: h, log: log, tmpl: tr}, nil
+	return &Server{svc: svc, hub: h, log: log, tmpl: tr, secret: []byte(secret)}, nil
 }
 
 func (s *Server) Routes() http.Handler {
@@ -148,7 +149,7 @@ type idRequest struct {
 
 func (s *Server) withPlayer(next func(w http.ResponseWriter, r *http.Request, player uuid.UUID)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		player := playerFromCookie(w, r)
+		player := s.playerFromCookie(w, r)
 		next(w, r.WithContext(playerContext(r.Context(), player)), player)
 	}
 }

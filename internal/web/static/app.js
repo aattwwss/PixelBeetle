@@ -32,6 +32,34 @@ let currentClaimId = null;
 // that changes lockAdds but not deltas must not re-apply the stale deltas).
 let lastBmp = null, lastDeltas = null, lastLockAdds = null, lastLockRemoves = null, lastLocks = null;
 
+// ---- palette color picker ----
+
+let selectedColor = 1; // palette index 0..15 used for the next claim
+
+// Build the 16 swatch buttons from PALETTE_RGB (same source of truth as the
+// canvas colors, so the picker can never drift from what gets painted).
+function buildPalette() {
+  const bar = document.getElementById('palette');
+  if (!bar) return;
+  bar.innerHTML = '';
+  PALETTE.forEach((hex, i) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'swatch' + (i === selectedColor ? ' selected' : '');
+    b.style.background = hex;
+    b.title = hex;
+    b.addEventListener('click', () => selectColor(i));
+    bar.appendChild(b);
+  });
+}
+
+window.selectColor = function (i) {
+  selectedColor = i;
+  document.querySelectorAll('#palette .swatch').forEach((el, idx) => {
+    el.classList.toggle('selected', idx === i);
+  });
+};
+
 function init() {
   canvas = document.getElementById('grid');
   ctx = canvas.getContext('2d');
@@ -69,6 +97,7 @@ function init() {
   }
 
   canvas.addEventListener('click', onCanvasClick);
+  buildPalette();
 
   fetch('/history')
     .then(r => r.json())
@@ -88,7 +117,7 @@ function onCanvasClick(evt) {
 }
 
 async function claim(x, y) {
-  const color = Math.floor(Math.random() * 16); // TODO: palette picker
+  const color = selectedColor;
   const res = await fetch('/claim', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },

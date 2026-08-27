@@ -10,6 +10,7 @@
   <header>
     <h1>Canvas Clash</h1>
     <p class="tagline">every pixel is a TigerBeetle transfer</p>
+    <div id="palette"></div>
     <div id="hud"></div>
   </header>
 
@@ -36,7 +37,7 @@
     <span class="replay-badge" data-show="$tsMs < {{.MaxTsMs}}">◀ REPLAY</span>
     <input type="range" class="slider" min="{{.MinTsMs}}" max="{{.MaxTsMs}}" value="{{.MaxTsMs}}"
            data-bind="tsMs"
-           data-on:input="pb.scrub(evt.target.value)">
+           data-on:input__throttle.80ms="pb.scrub(evt.target.value)">
     <span class="time-label" data-text="new Date($tsMs).toLocaleString()"></span>
   </footer>
 

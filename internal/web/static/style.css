@@ -8,6 +8,28 @@ h1 { font-size: 1.2rem; margin: 0; }
 #hud button { margin-left: .5rem; cursor: pointer; }
 #hud .countdown { font-size: .8rem; color: #ffd600; }
 
+/* palette color picker */
+#palette {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  margin-left: .5rem;
+}
+#palette .swatch {
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 2px solid transparent;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: transform .08s ease;
+}
+#palette .swatch:hover { transform: scale(1.15); }
+#palette .swatch.selected {
+  border-color: #ffd600;
+  box-shadow: 0 0 0 1px #111 inset;
+}
+
 #canvas-wrap {
   padding: 8px;
   overflow: auto;

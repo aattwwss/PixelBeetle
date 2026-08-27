@@ -16,6 +16,7 @@ import (
 	"log/slog"
 	"math/rand"
 	"net/http"
+	"net/http/cookiejar"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -103,6 +104,10 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) (*Metrics, error) {
 	}
 
 	httpc := &http.Client{Timeout: 5 * time.Second}
+// playerIDs are the per-agent identities used in DIRECT mode (where the
+// bot writes straight to TigerBeetle via tbclient.NewClaim). In API mode the
+// server mints the identity itself via the signed player_id cookie captured
+// by each agent's cookie jar, so these UUIDs are never sent over HTTP.
 	playerIDs := make([]uuid.UUID, cfg.Players)
 	for i := range playerIDs {
 		playerIDs[i] = uuid.Must(uuid.NewV7())
@@ -186,6 +191,18 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) (*Metrics, error) {
 		go func(player uuid.UUID, seed int) {
 			defer wg.Done()
 			rng := rand.New(rand.NewSource(int64(seed)))
+
+			// Each API-mode agent gets its own cookie jar so the server's
+			// signed player_id cookie (set on the first claim) is captured
+			// and reused on subsequent requests, preserving per-agent
+			// identity continuity (supersede/cancel pair correctly).
+			var agentClient *http.Client
+			if direct == nil {
+				jar, _ := cookiejar.New(nil)
+				agentClient = &http.Client{Timeout: 5 * time.Second, Jar: jar}
+			} else {
+				agentClient = httpc
+			}
 			for range tokens {
 				select {
 				case <-ctx.Done():
@@ -202,7 +219,7 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) (*Metrics, error) {
 				color := uint8(rng.Intn(16))
 
 				started := time.Now()
-				claimID, err := submitClaim(ctx, httpc, direct, cfg.Target, player, x, y, color)
+				claimID, err := submitClaim(ctx, agentClient, direct, cfg.Target, player, x, y, color)
 				if err != nil {
 					m.recordFailure(err, &m.Errors)
 					continue
@@ -221,7 +238,7 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) (*Metrics, error) {
 					m.dropLatency(started)
 					continue
 				}
-				if err := resolveClaim(ctx, httpc, direct, cfg.Target, player, claimID, x, y, true); err != nil {
+				if err := resolveClaim(ctx, agentClient, direct, cfg.Target, claimID, x, y, true); err != nil {
 					m.recordFailure(err, &m.Errors)
 					continue
 				}
@@ -300,7 +317,6 @@ func submitClaim(ctx context.Context, hc *http.Client, direct *tbclient.Client, 
 		return "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.AddCookie(&http.Cookie{Name: "player_id", Value: player.String()})
 	resp, err := hc.Do(req)
 	if err != nil {
 		return "", err
@@ -320,9 +336,8 @@ func submitClaim(ctx context.Context, hc *http.Client, direct *tbclient.Client, 
 	return out.ClaimID, nil
 }
 
-func resolveClaim(ctx context.Context, hc *http.Client, direct *tbclient.Client, target string, player uuid.UUID, claimID string, x, y uint32, confirm bool) error {
+func resolveClaim(ctx context.Context, hc *http.Client, direct *tbclient.Client, target string, claimID string, x, y uint32, confirm bool) error {
 	if direct != nil {
-		_ = player
 		raw, err := hex.DecodeString(claimID)
 		if err != nil || len(raw) != 16 {
 			return fmt.Errorf("invalid claim id %q", claimID)
@@ -344,7 +359,6 @@ func resolveClaim(ctx context.Context, hc *http.Client, direct *tbclient.Client,
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.AddCookie(&http.Cookie{Name: "player_id", Value: player.String()})
 	resp, err := hc.Do(req)
 	if err != nil {
 		return err
