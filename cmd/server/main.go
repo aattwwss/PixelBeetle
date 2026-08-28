@@ -27,6 +27,8 @@ func main() {
 		reapPeriod  = flag.Duration("reap-period", time.Second, "lock reaper interval")
 		warmup      = flag.Bool("warmup", true, "rebuild pixel cache from TigerBeetle transfer history at startup")
 		eager       = flag.Bool("eager", true, "create+fund all pixel accounts at startup (N accounts before the first paint)")
+		snapshot    = flag.String("snapshot", "data/snapshot.bin", "on-disk materialized-state snapshot path (\"\" = full replay every boot)")
+		snapEvery   = flag.Duration("snapshot-every", 30*time.Second, "periodic snapshot interval; only writes when history grew")
 		cdcURL      = flag.String("cdc-url", "", "AMQP URL for the TigerBeetle CDC stream (empty = disabled), e.g. amqp://guest:guest@localhost:5672/")
 		cdcExchange = flag.String("cdc-exchange", "tigerbeetle", "AMQP exchange the CDC job publishes to")
 		secret      = flag.String("secret", "pixelbeetle-demo-secret-change-me", "HMAC key signing the player_id cookie")
@@ -67,6 +69,10 @@ func main() {
 		}
 	}
 
+	if *snapshot != "" {
+		svc.SetSnapshot(*snapshot)
+	}
+
 	if *warmup {
 		if err := svc.WarmCache(); err != nil {
 			log.Error("warm cache", "err", err)
@@ -102,6 +108,36 @@ func main() {
 		os.Exit(1)
 	}
 	webSrv.StartMetrics(context.Background()) // live dashboard over the SSE hub
+
+	if *snapshot != "" && *snapEvery > 0 { // persist the derived state so the next boot is O(delta)
+		// Baseline: write once right after warmup so the boot-time replay work is
+		// persisted even if the process dies before the next tick. Then the ticker
+		// only rewrites when history has grown (avoids rewriting a 50MB file
+		// pointlessly every interval).
+		if err := svc.SaveSnapshot(*snapshot); err != nil {
+			log.Error("snapshot save (initial)", "err", err)
+		} else {
+			log.Info("snapshot saved (initial)", "path", *snapshot,
+				"events", svc.HistoryLen())
+		}
+		last := svc.HistoryLen()
+		go func() {
+			t := time.NewTicker(*snapEvery)
+			defer t.Stop()
+			for range t.C {
+				cur := svc.HistoryLen()
+				if cur == last {
+					continue // nothing new to snapshot
+				}
+				if err := svc.SaveSnapshot(*snapshot); err != nil {
+					log.Error("snapshot save", "err", err)
+				} else {
+					log.Info("snapshot saved", "path", *snapshot, "events", cur)
+				}
+				last = cur
+			}
+		}()
+	}
 
 	log.Info("canvas clash starting", "addr", *addr, "desc", svc.Describe())
 	if err := http.ListenAndServe(*addr, webSrv.Routes()); err != nil {

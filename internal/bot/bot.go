@@ -104,10 +104,10 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) (*Metrics, error) {
 	}
 
 	httpc := &http.Client{Timeout: 5 * time.Second}
-// playerIDs are the per-agent identities used in DIRECT mode (where the
-// bot writes straight to TigerBeetle via tbclient.NewClaim). In API mode the
-// server mints the identity itself via the signed player_id cookie captured
-// by each agent's cookie jar, so these UUIDs are never sent over HTTP.
+	// playerIDs are the per-agent identities used in DIRECT mode (where the
+	// bot writes straight to TigerBeetle via tbclient.NewClaim). In API mode the
+	// server mints the identity itself via the signed player_id cookie captured
+	// by each agent's cookie jar, so these UUIDs are never sent over HTTP.
 	playerIDs := make([]uuid.UUID, cfg.Players)
 	for i := range playerIDs {
 		playerIDs[i] = uuid.Must(uuid.NewV7())

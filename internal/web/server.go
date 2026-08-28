@@ -5,6 +5,7 @@ package web
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"log/slog"
 	"net/http"
@@ -15,6 +16,7 @@ import (
 
 	"pixelbeetle/internal/game"
 	"pixelbeetle/internal/hub"
+	"pixelbeetle/internal/tbclient"
 )
 
 type Server struct {
@@ -159,6 +161,10 @@ func (s *Server) handleClaim(w http.ResponseWriter, r *http.Request, player uuid
 	if !decodeJSON(w, r, &req) {
 		return
 	}
+	if req.Color > tbclient.MaxColor {
+		http.Error(w, fmt.Sprintf("color must be 0-%d", tbclient.MaxColor), http.StatusBadRequest)
+		return
+	}
 	id, err := s.svc.Claim(player, req.X, req.Y, req.Color)
 	switch {
 	case errors.Is(err, game.ErrLockedByOther):
@@ -220,6 +226,10 @@ func (s *Server) failClaim(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, game.ErrUnknownClaim):
 		http.Error(w, err.Error(), http.StatusNotFound)
+	case errors.Is(err, tbclient.ErrClaimExpired):
+		// The pending claim timed out in TB before this leg arrived — a normal
+		// outcome, not a server fault. The cell is already claimable again.
+		http.Error(w, "claim expired, cell released", http.StatusGone)
 	default:
 		s.log.Error("resolve claim", "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)

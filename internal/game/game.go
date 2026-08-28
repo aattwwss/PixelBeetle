@@ -64,6 +64,8 @@ type Service struct {
 	created    map[uint64]struct{}    // pixel accounts already ensured in TB
 	allCreated bool                   // true once every pixel account is eagerly created+funded
 	history    []PaintEvent           // posted claims, ascending ts — the slider manifest (in-memory)
+	warmTs     uint64                 // watermark: last transfer ts folded by WarmCache (ns); CDC events at/below it are history replays
+	snapshot   string                 // on-disk snapshot path ("" = full replay every boot)
 	hub        *hub.Hub
 	tb         *tbclient.Client
 	log        *slog.Logger
@@ -141,7 +143,15 @@ func (s *Service) Claim(player uuid.UUID, x, y uint32, color uint8) ([16]byte, e
 	// self-expires in TB after its timeout; the UI is already consistent.
 	if hadOld {
 		if err := s.tb.Submit(tbclient.BuildVoid(u128(old.Transfer))); err != nil {
-			s.log.Warn("failed to void superseded claim", "err", err)
+			if errors.Is(err, tbclient.ErrClaimExpired) {
+				// TB already voided the expired pending and freed the old cell —
+				// broadcast the unlock so clients clear the stale yellow box (the
+				// reaper never sees this lock again, it was vacated above).
+				s.hub.BroadcastUnlock(old.X, old.Y)
+				s.log.Debug("superseded claim already expired in TB")
+			} else {
+				s.log.Warn("failed to void superseded claim", "err", err)
+			}
 		} else {
 			s.hub.BroadcastUnlock(old.X, old.Y)
 		}
@@ -174,6 +184,12 @@ func (s *Service) Confirm(player uuid.UUID, claimID [16]byte) error {
 	}
 	confirm := tbclient.BuildConfirm(u128(meta.Transfer), meta.X, meta.Y)
 	if err := s.tb.SubmitBatch(confirm); err != nil {
+		if errors.Is(err, tbclient.ErrClaimExpired) {
+			// The pending timed out in TB before this confirm landed — TB already
+			// voided it and freed the cell. Expected under load, not an error.
+			s.metrics.expires.Add(1)
+			return err
+		}
 		s.metrics.errors.Add(1)
 		return err
 	}
@@ -270,6 +286,14 @@ func (s *Service) History() []PaintEvent {
 	return out
 }
 
+// HistoryLen returns the current manifest length without copying (the server
+// ticker uses it to decide whether a snapshot save is needed).
+func (s *Service) HistoryLen() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.history)
+}
+
 // TransferTimeRange returns the earliest and latest canvas transfer timestamps
 // in milliseconds since epoch. Used as the time-travel slider's min/max bounds
 // so the slider spans the actual data range (not epoch→now, which leaves 99%
@@ -283,9 +307,23 @@ func (s *Service) TransferTimeRange() (uint64, uint64) {
 	return uint64(s.history[0].TsMs), uint64(s.history[len(s.history)-1].TsMs)
 }
 
+// SetSnapshot configures an on-disk materialized-state snapshot for O(delta)
+// restarts. Call before WarmCache; the server ticker should periodically call
+// SaveSnapshot so the file tracks the live state.
+func (s *Service) SetSnapshot(path string) { s.snapshot = path }
+
 // WarmCache rebuilds the pixel cache from TigerBeetle transfer history so a
 // restarted server shows the canvas instead of a blank grid.
 func (s *Service) WarmCache() error {
+	// Fast path: load the on-disk snapshot, then fold only the delta since it.
+	if s.snapshot != "" {
+		if used, err := s.warmFromSnapshot(s.snapshot); err == nil {
+			_ = used
+			return nil
+		} else {
+			s.log.Warn("snapshot unusable, falling back to full replay", "err", err)
+		}
+	}
 	const limit = 4000
 	start := time.Now()
 	s.log.Info("warmup starting: replaying canvas history from TigerBeetle")
@@ -293,12 +331,16 @@ func (s *Service) WarmCache() error {
 	var history []PaintEvent
 	var from uint64
 	var scanned uint64
+	var lastTs uint64 // max transfer timestamp folded (the CDC watermark)
 	for pageIdx := 0; ; pageIdx++ {
 		page, err := s.tb.QueryCanvasTransfers(from, limit)
 		if err != nil {
 			return err
 		}
 		scanned += uint64(len(page))
+		if len(page) > 0 {
+			lastTs = page[len(page)-1].Timestamp
+		}
 		for _, t := range page {
 			x, y, color, ok := warm.PostedClaim(t, s.gridW, s.gridH)
 			if !ok {
@@ -325,6 +367,10 @@ func (s *Service) WarmCache() error {
 		s.pixels[k] = p
 	}
 	s.history = history
+	// Watermark: everything at/below the newest folded transfer is history
+	// the CDC stream will re-deliver. ApplyEvent drops those so a backlog
+	// replay can't re-broadcast old paints or bloat the slider manifest.
+	s.warmTs = lastTs
 	s.mu.Unlock()
 	s.log.Info("warmup complete", "scanned", scanned, "pixels", len(seen), "elapsed", time.Since(start).Round(time.Millisecond))
 	return nil
@@ -337,6 +383,12 @@ func (s *Service) WarmCache() error {
 func (s *Service) ApplyEvent(ev replay.Event) {
 	if ev.Type != replay.TypePosted {
 		return
+	}
+	s.mu.Lock()
+	stale := ev.Timestamp <= s.warmTs
+	s.mu.Unlock()
+	if stale {
+		return // already folded into the cache by WarmCache
 	}
 	key := pack(ev.X, ev.Y)
 	s.mu.Lock()

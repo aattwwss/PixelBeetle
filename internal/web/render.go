@@ -81,12 +81,12 @@ func (s *Server) playerFromCookie(w http.ResponseWriter, r *http.Request) uuid.U
 	}
 	u := uuid.Must(uuid.NewV7())
 	http.SetCookie(w, &http.Cookie{
-		Name:    playerCookie,
-		Value:   signPlayer(s.secret, u),
-		Path:    "/",
-		Expires: time.Now().Add(365 * 24 * time.Hour),
-		Secure:   false,   // demo runs on localhost
-	HttpOnly: true,    // not readable from JS: defends against XSS impersonation
+		Name:     playerCookie,
+		Value:    signPlayer(s.secret, u),
+		Path:     "/",
+		Expires:  time.Now().Add(365 * 24 * time.Hour),
+		Secure:   false, // demo runs on localhost
+		HttpOnly: true,  // not readable from JS: defends against XSS impersonation
 	})
 	return u
 }

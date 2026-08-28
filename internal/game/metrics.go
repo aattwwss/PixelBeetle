@@ -17,10 +17,10 @@ type metrics struct {
 	conflicts atomic.Uint64
 	errors    atomic.Uint64
 
-	prevClaims    uint64
-	prevConfirms  uint64
-	prevTick      time.Time
-	claimsPerSec  atomic.Uint64
+	prevClaims     uint64
+	prevConfirms   uint64
+	prevTick       time.Time
+	claimsPerSec   atomic.Uint64
 	confirmsPerSec atomic.Uint64
 }
 

@@ -19,8 +19,14 @@ const (
 	AccountCodePixel  uint16 = 1000
 
 	// Transfer code carries the chosen color (0–255).
-	TransferCodeClaim  uint16 = 1000 // base code; color OR'd in by NewClaim
+	TransferCodeClaim  uint16 = 1000 // base code; color ADDED by NewClaim (never OR: 1000 has bit 3 set, so OR aliases colors 8-15 onto 0-7)
 	TransferCodeRefund uint16 = 1001 // re-fund leg after a posted claim
+	// MaxColor is the inclusive upper bound of palette indices (16 colors).
+	// Enforced at the API so claim codes stay within 1000..1015 and can never
+	// wander into other code ranges. Code 1001 (claim color 1) is also
+	// TransferCodeRefund; the two are disambiguated by transfer flags —
+	// posted-claim legs always carry the post_pending_transfer bit.
+	MaxColor uint8 = 15
 
 	ClaimTimeoutSeconds uint32 = 3 // pending-lock window
 )
@@ -40,6 +46,11 @@ const fundMarker uint64 = 0xF00D
 // ErrPixelLocked means TigerBeetle itself rejected the claim because the
 // pixel's claimable unit is already reserved by a pending transfer.
 var ErrPixelLocked = fmt.Errorf("pixel already claimed")
+
+// ErrClaimExpired means the pending claim transfer timed out in TigerBeetle
+// (ClaimTimeoutSeconds) before this leg arrived — TB already voided it and
+// freed the pixel. A normal, expected race under load, not a server fault.
+var ErrClaimExpired = fmt.Errorf("claim expired")
 
 type Client struct {
 	tb tb.Client
@@ -225,7 +236,7 @@ func NewClaim(x, y uint32, color uint8, player uuid.UUID) tb.Transfer {
 		CreditAccountID: SystemPoolID,
 		Amount:          tb.ToUint128(1),
 		UserData128:     tb.BytesToUint128(player),
-		Code:            TransferCodeClaim | uint16(color),
+		Code:            TransferCodeClaim + uint16(color),
 		Timeout:         ClaimTimeoutSeconds,
 		Ledger:          LedgerCanvas,
 		Flags:           flags.ToUint16(),
@@ -290,6 +301,8 @@ func (c *Client) SubmitBatch(transfers []tb.Transfer) error {
 			continue // idempotent successes
 		case tb.TransferExceedsCredits:
 			return ErrPixelLocked
+		case tb.TransferPendingTransferExpired:
+			return ErrClaimExpired
 		default:
 			return fmt.Errorf("tbclient: create_transfers failed: status=%s", r.Status)
 		}
