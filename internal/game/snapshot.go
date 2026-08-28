@@ -40,6 +40,12 @@ func paintEventSize() int { return 8 + 4 + 4 + 1 } // tsMs + x + y + color
 // has grown since the last save.
 func (s *Service) SaveSnapshot(path string) error {
 	s.mu.Lock()
+	if !s.warmed {
+		s.mu.Unlock()
+		return fmt.Errorf("snapshot: save skipped, warmup has not completed " +
+			"(this process may hold partial state; refusing to overwrite " +
+			"a snapshot that may be good)")
+	}
 	hist := make([]PaintEvent, len(s.history))
 	copy(hist, s.history)
 	wm := s.warmTs
@@ -118,6 +124,10 @@ func (s *Service) loadSnapshotFile(path string) (map[uint64]Pixel, []PaintEvent,
 
 	pixels := make(map[uint64]Pixel, count)
 	history := make([]PaintEvent, 0, count)
+	if count == 0 {
+		s.log.Warn("snapshot is empty — a partial-state server may have " +
+			"overwritten it earlier; falling through to a full delta scan")
+	}
 	for i := 0; i < int(count); i++ {
 		e := body[i*paintEventSize() : (i+1)*paintEventSize()]
 		ev := PaintEvent{
@@ -178,6 +188,7 @@ func (s *Service) warmFromSnapshot(path string) (bool, error) {
 	s.pixels = seen
 	s.history = hist
 	s.warmTs = wm
+	s.warmed = true
 	s.mu.Unlock()
 	s.log.Info("warmup complete (snapshot + delta)", "scanned", scanned,
 		"pixels", len(seen), "elapsed", time.Since(start).Round(time.Millisecond))

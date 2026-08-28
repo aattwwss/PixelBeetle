@@ -1,4 +1,6 @@
-// Package bot is the Canvas Clash load generator (plan.md §4).
+// Package bot is the PixelBeetle load generator: N agent goroutines claim and
+// confirm random cells at a shared rate to demonstrate TigerBeetle throughput
+// and measure latency, lock conflicts and expiry rates under load.
 //
 // Modes:
 //   - api:    HTTP against the game server (end-to-end: locks, cache, SSE)

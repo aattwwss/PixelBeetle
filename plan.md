@@ -1,4 +1,4 @@
-# Canvas Clash — Implementation Plan
+# PixelBeetle — Implementation Plan
 
 A r/place-style multiplayer pixel game whose entire state lives in **TigerBeetle**.
 Primary objective: **showcase TigerBeetle** — two-phase transfers, idempotency,

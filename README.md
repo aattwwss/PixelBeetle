@@ -1,4 +1,4 @@
-# PixelBeetle — Canvas Clash
+# PixelBeetle
 
 A r/place-style pixel game whose entire state lives in [TigerBeetle](https://github.com/tigerbeetle/tigerbeetle).
 Built to showcase two-phase transfers, idempotency, immutable history, CDC, and fault tolerance.

@@ -1,4 +1,4 @@
-// Canvas Clash game server: SSR pages + claim endpoints + SSE hub.
+// PixelBeetle game server: SSR pages + claim endpoints + SSE hub.
 package main
 
 import (
@@ -109,7 +109,10 @@ func main() {
 	}
 	webSrv.StartMetrics(context.Background()) // live dashboard over the SSE hub
 
-	if *snapshot != "" && *snapEvery > 0 { // persist the derived state so the next boot is O(delta)
+	if *snapshot != "" && *warmup && *snapEvery > 0 { // persist the derived state so the next boot is O(delta)
+		// Gated on -warmup: a server that skipped warmup holds partial state
+		// (CDC-fed only) and must never write the snapshot file. SaveSnapshot
+		// enforces the same invariant defensively.
 		// Baseline: write once right after warmup so the boot-time replay work is
 		// persisted even if the process dies before the next tick. Then the ticker
 		// only rewrites when history has grown (avoids rewriting a 50MB file
@@ -139,7 +142,7 @@ func main() {
 		}()
 	}
 
-	log.Info("canvas clash starting", "addr", *addr, "desc", svc.Describe())
+	log.Info("pixelbeetle starting", "addr", *addr, "desc", svc.Describe())
 	if err := http.ListenAndServe(*addr, webSrv.Routes()); err != nil {
 		log.Error("listen", "err", err)
 		os.Exit(1)

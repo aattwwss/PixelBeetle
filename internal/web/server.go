@@ -236,7 +236,7 @@ func (s *Server) failClaim(w http.ResponseWriter, err error) {
 	}
 }
 
-// ---- admin (bot load-generator heartbeat for the dashboard, plan.md §4.1) ----
+// ---- admin (bot load-generator heartbeat feeding the live metrics dashboard) ----
 
 // handleAdminBots absorbs the load generator's periodic heartbeat. It validates
 // nothing beyond JSON shape (demo telemetry); the merged snapshot is pushed to

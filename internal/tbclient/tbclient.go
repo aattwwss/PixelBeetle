@@ -1,4 +1,4 @@
-// Package tbclient wraps the TigerBeetle Go client with Canvas Clash domain
+// Package tbclient wraps the TigerBeetle Go client with PixelBeetle domain
 // conventions. All claim construction lives here so the game server and the
 // load generator build byte-identical transfers.
 package tbclient
@@ -11,7 +11,10 @@ import (
 	tb "github.com/tigerbeetle/tigerbeetle-go"
 )
 
-// Domain conventions (see plan.md §1 + docs/tigerbeetle-cheatsheet.md).
+// Domain conventions for the PixelBeetle canvas: everything lives on one
+// ledger; each grid cell is an account whose balance of 1 IS its claimable
+// state; transfer codes carry the palette color so the immutable transfer
+// history can be replayed into a full canvas.
 const (
 	LedgerCanvas uint32 = 1 // ledger 1 == "Canvas"
 

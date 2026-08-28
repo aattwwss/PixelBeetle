@@ -1,4 +1,4 @@
-// Canvas Clash client glue.
+// PixelBeetle client glue.
 //
 // The grid is a <canvas> drawn from a packed byte array (one byte per cell;
 // 0 = empty, 1..16 = palette color + 1). The server ships the canvas as

@@ -1,4 +1,4 @@
-// Canvas Clash load generator entry point.
+// PixelBeetle load generator entry point.
 package main
 
 import (

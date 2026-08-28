@@ -1,4 +1,4 @@
-// Package game holds Canvas Clash application logic: the pixel read cache,
+// Package game holds PixelBeetle application logic: the pixel read cache,
 // the pending-lock table, and the claim service coordinating TigerBeetle with
 // the SSE hub.
 package game
@@ -65,6 +65,7 @@ type Service struct {
 	allCreated bool                   // true once every pixel account is eagerly created+funded
 	history    []PaintEvent           // posted claims, ascending ts — the slider manifest (in-memory)
 	warmTs     uint64                 // watermark: last transfer ts folded by WarmCache (ns); CDC events at/below it are history replays
+	warmed     bool                   // true once WarmCache completed; only a fully-warmed process may write snapshots
 	snapshot   string                 // on-disk snapshot path ("" = full replay every boot)
 	hub        *hub.Hub
 	tb         *tbclient.Client
@@ -371,6 +372,7 @@ func (s *Service) WarmCache() error {
 	// the CDC stream will re-deliver. ApplyEvent drops those so a backlog
 	// replay can't re-broadcast old paints or bloat the slider manifest.
 	s.warmTs = lastTs
+	s.warmed = true
 	s.mu.Unlock()
 	s.log.Info("warmup complete", "scanned", scanned, "pixels", len(seen), "elapsed", time.Since(start).Round(time.Millisecond))
 	return nil
@@ -459,12 +461,11 @@ func (s *Service) ensureSystemPool() {
 	})
 }
 
-// ensurePixel creates the pixel's account once per process lifetime.
-// TODO(plan §4): fold into the batching layer so first-touch claims ride
-// along with concurrent batches instead of paying their own round trip.
 // ensurePixel creates the pixel's account (with the exclusivity flag) and
 // funds its single claimable unit. Both steps are idempotent across restarts
-// (exists == ok).
+// (exists == ok). Accounts are normally provisioned in bulk at boot via
+// InitAllPixels; this first-touch path covers cells claimed before that
+// finishes or when -eager is off, so a claim never races account creation.
 func (s *Service) ensurePixel(x, y uint32) {
 	s.mu.Lock()
 	all := s.allCreated
