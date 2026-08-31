@@ -21,8 +21,8 @@ import (
 //go:embed static/*
 var staticFS embed.FS
 
-//go:embed templates/index.html
-var indexHTML embed.FS
+//go:embed templates/index.html templates/history.html
+var pageTemplates embed.FS
 
 const playerCookie = "player_id"
 
@@ -98,28 +98,38 @@ func playerContext(ctx context.Context, u uuid.UUID) context.Context {
 // ---- templates ----
 
 type templateRenderer struct {
-	index *template.Template
+	index   *template.Template
+	history *template.Template
 }
 
 func newTemplateRenderer() (*templateRenderer, error) {
-	idx, err := template.New("index.html").ParseFS(indexHTML, "templates/index.html")
+	idx, err := template.New("index.html").ParseFS(pageTemplates, "templates/index.html")
 	if err != nil {
 		return nil, err
 	}
-	return &templateRenderer{index: idx}, nil
+	his, err := template.New("history.html").ParseFS(pageTemplates, "templates/history.html")
+	if err != nil {
+		return nil, err
+	}
+	return &templateRenderer{index: idx, history: his}, nil
 }
 
 func (tr *templateRenderer) renderIndex(w io.Writer, svc *game.Service) error {
 	bmpB64, locks := svc.SnapshotBmp()
 	gw, gh := svc.Grid()
 	initialJSON, _ := json.Marshal(map[string]any{"bmp": bmpB64, "locks": locks})
-	minMs, maxMs := svc.TransferTimeRange()
 	return tr.index.ExecuteTemplate(w, "index.html", map[string]any{
 		"InitialJSON": template.JS(initialJSON), // valid JSON object; trusted (base64 + ints only)
 		"Cols":        gw,
 		"Rows":        gh,
-		"MinTsMs":     minMs,
-		"MaxTsMs":     maxMs,
+	})
+}
+
+func (tr *templateRenderer) renderHistory(w io.Writer, svc *game.Service) error {
+	gw, gh := svc.Grid()
+	return tr.history.ExecuteTemplate(w, "history.html", map[string]any{
+		"Cols": gw,
+		"Rows": gh,
 	})
 }
 

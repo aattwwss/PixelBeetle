@@ -1,4 +1,4 @@
-// PixelBeetle client glue.
+// PixelBeetle client glue — the paint view.
 //
 // The grid is a <canvas> drawn from a packed byte array (one byte per cell;
 // 0 = empty, 1..16 = palette color + 1). The server ships the canvas as
@@ -9,13 +9,8 @@
 //
 // A single DataStar effect calls pb.render() whenever any of those signals
 // change; pb.render diffs against the previous values and draws only what
-// changed. Time travel is client-side: the slider bisects a manifest fetched
-// once from GET /history and redraws the canvas — no per-tick server round trip.
-
-const PALETTE = ["#ffffff", "#e4e4e4", "#888888", "#222222", "#ffb470", "#9a6324", "#800000", "#ba2d2d",
-                 "#ffd600", "#808000", "#469990", "#42d4f4", "#4363d8", "#000075", "#f032e6", "#fabed4"];
-const PALETTE_RGB = PALETTE.map(h => [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)]);
-const EMPTY_RGB = [0x1c, 0x1c, 0x1c];
+// changed. History/time-travel lives on its own page (/history) so this view
+// never pays for it — see history.js.
 
 const pb = {};
 window.pb = pb;
@@ -24,8 +19,6 @@ let canvas, ctx, cols, rows;
 let olCanvas, olCtx; // lock overlay: yellow border boxes drawn above the bitmap
 let liveBmp = null;      // Uint8Array W*H (bitmap values 0..16)
 let lockSet = new Set(); // "x,y" strings currently locked
-let scrubEvents = null;  // [{ts,x,y,c}] sorted ascending, from GET /history
-let scrubbing = false;
 let currentClaimId = null;
 
 // Reference tracking so each signal value is applied exactly once (a flush
@@ -98,17 +91,11 @@ function init() {
 
   canvas.addEventListener('click', onCanvasClick);
   buildPalette();
-
-  fetch('/history')
-    .then(r => r.json())
-    .then(h => { scrubEvents = h.events || []; })
-    .catch(e => console.warn('history fetch failed', e));
 }
 
 // ---- input: click -> claim (two-phase: claim, then confirm/cancel in HUD) ----
 
 function onCanvasClick(evt) {
-  if (scrubbing) return; // no claims while time-traveling
   const rect = canvas.getBoundingClientRect();
   const x = Math.floor((evt.clientX - rect.left) / rect.width * cols);
   const y = Math.floor((evt.clientY - rect.top) / rect.height * rows);
@@ -223,70 +210,30 @@ pb.render = function (bmp, deltas, lockAdds, lockRemoves, locks) {
     if (bytes.length === liveBmp.length) {
       for (let i = 0; i < bytes.length; i++) liveBmp[i] = bytes.charCodeAt(i);
     }
-    if (!scrubbing) renderFull();
+    renderFull();
   }
 
   if (deltas && deltas !== lastDeltas) {
     lastDeltas = deltas;
     for (const [x, y, v] of deltas) liveBmp[y * cols + x] = v;
-    if (!scrubbing) for (const [x, y] of deltas) fillCell(x, y);
+    for (const [x, y] of deltas) fillCell(x, y);
   }
 
   if (locks !== lastLocks) {
     lastLocks = locks;
     lockSet = new Set((locks || []).map(([x, y]) => `${x},${y}`));
-    if (!scrubbing) renderFull();
+    renderFull();
   }
   if (lockAdds && lockAdds !== lastLockAdds) {
     lastLockAdds = lockAdds;
     for (const [x, y] of (lockAdds || [])) lockSet.add(`${x},${y}`);
-    if (!scrubbing) for (const [x, y] of (lockAdds || [])) drawLock(x, y);
+    for (const [x, y] of (lockAdds || [])) drawLock(x, y);
   }
   if (lockRemoves && lockRemoves !== lastLockRemoves) {
     lastLockRemoves = lockRemoves;
-    for (const [x, y] of (lockRemoves || [])) {
-      if (!scrubbing) clearLock(x, y);
-      lockSet.delete(`${x},${y}`);
-    }
+    for (const [x, y] of (lockRemoves || [])) clearLock(x, y);
+    for (const [x, y] of (lockRemoves || [])) lockSet.delete(`${x},${y}`);
   }
 };
-
-// ---- time travel (client-side) ----
-
-pb.scrub = function (tsMs) {
-  if (!scrubEvents) return;
-  scrubbing = true;
-  if (olCtx) olCtx.clearRect(0, 0, olCanvas.width, olCanvas.height); // history view: no lock overlays
-  const idx = bisect(scrubEvents, Number(tsMs));
-  const tmp = new Uint8Array(cols * rows);
-  for (let i = 0; i < idx; i++) {
-    const e = scrubEvents[i];
-    tmp[e.y * cols + e.x] = (e.c % 16) + 1;
-  }
-  const img = ctx.createImageData(cols, rows);
-  const d = img.data;
-  for (let i = 0; i < tmp.length; i++) {
-    const v = tmp[i];
-    const rgb = v ? PALETTE_RGB[(v - 1) % 16] : EMPTY_RGB;
-    const o = i * 4;
-    d[o] = rgb[0]; d[o + 1] = rgb[1]; d[o + 2] = rgb[2]; d[o + 3] = 255;
-  }
-  ctx.putImageData(img, 0, 0);
-};
-
-pb.live = function () {
-  window.location.reload(); // simplest correct reset back to live + SSE
-};
-
-// number of events with ts <= target (first index past the cutoff)
-function bisect(events, ts) {
-  let lo = 0, hi = events.length;
-  while (lo < hi) {
-    const mid = (lo + hi) >> 1;
-    if (events[mid].ts <= ts) lo = mid + 1;
-    else hi = mid;
-  }
-  return lo;
-}
 
 init();

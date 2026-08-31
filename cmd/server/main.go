@@ -115,27 +115,22 @@ func main() {
 		// enforces the same invariant defensively.
 		// Baseline: write once right after warmup so the boot-time replay work is
 		// persisted even if the process dies before the next tick. Then the ticker
-		// only rewrites when history has grown (avoids rewriting a 50MB file
-		// pointlessly every interval).
+		// only rewrites when the watermark has advanced (any ledger activity),
+		// avoiding pointless rewrites of an unchanged file.
 		if err := svc.SaveSnapshot(*snapshot); err != nil {
 			log.Error("snapshot save (initial)", "err", err)
-		} else {
-			log.Info("snapshot saved (initial)", "path", *snapshot,
-				"events", svc.HistoryLen())
 		}
-		last := svc.HistoryLen()
+		last := svc.WarmTs()
 		go func() {
 			t := time.NewTicker(*snapEvery)
 			defer t.Stop()
 			for range t.C {
-				cur := svc.HistoryLen()
+				cur := svc.WarmTs()
 				if cur == last {
 					continue // nothing new to snapshot
 				}
 				if err := svc.SaveSnapshot(*snapshot); err != nil {
 					log.Error("snapshot save", "err", err)
-				} else {
-					log.Info("snapshot saved", "path", *snapshot, "events", cur)
 				}
 				last = cur
 			}

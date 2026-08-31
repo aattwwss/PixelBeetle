@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -63,7 +64,9 @@ func (s *Server) Routes() http.Handler {
 	}
 	mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.FS(staticRoot))))
 	mux.HandleFunc("GET /sse", s.handleSSE)
-	mux.HandleFunc("GET /history", s.handleHistory) // time-travel manifest (client-side slider)
+	mux.HandleFunc("GET /history", s.handleHistoryPage) // timelapse view (separate page; the canvas homepage stays history-free)
+	mux.HandleFunc("GET /api/history/meta", s.handleHistoryMeta)
+	mux.HandleFunc("GET /api/history/frame", s.handleHistoryFrame)
 	mux.HandleFunc("POST /claim", s.withPlayer(s.handleClaim))
 	mux.HandleFunc("POST /confirm", s.withPlayer(s.handleConfirm))
 	mux.HandleFunc("POST /cancel", s.withPlayer(s.handleCancel))
@@ -124,13 +127,47 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 	s.hub.ServeSSE(w, r, s.svc.SnapshotBmp)
 }
 
-// ---- time travel ----
+// ---- history (timelapse view) ----
 
-// handleHistory returns every posted paint (ascending by timestamp) as a
-// compact JSON manifest. The client fetches it once, then bisects it locally
-// while dragging the slider — no per-tick server round-trip.
-func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, map[string]any{"events": s.svc.History()})
+// handleHistoryPage serves the timelapse view: a slider whose every stop is
+// a live TigerBeetle query (anchor bitmap + at most one minute of events).
+func (s *Server) handleHistoryPage(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := s.tmpl.renderHistory(w, s.svc); err != nil {
+		s.log.Error("render history", "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+	}
+}
+
+// handleHistoryMeta returns the timeline bounds for the slider.
+func (s *Server) handleHistoryMeta(w http.ResponseWriter, r *http.Request) {
+	minMs, maxMs, intervalMs := s.svc.HistoryMeta()
+	gw, gh := s.svc.Grid()
+	writeJSON(w, map[string]any{
+		"minMs":      minMs,
+		"maxMs":      maxMs,
+		"intervalMs": intervalMs,
+		"gridW":      gw,
+		"gridH":      gh,
+	})
+}
+
+// handleHistoryFrame renders the canvas at one instant — one live TB query
+// per request (anchor fold + at most one minute of events). ts_ms comes in
+// as a query param; the slider quantizes to it client-side.
+func (s *Server) handleHistoryFrame(w http.ResponseWriter, r *http.Request) {
+	ts, err := strconv.ParseInt(r.URL.Query().Get("ts_ms"), 10, 64)
+	if err != nil || ts < 0 {
+		http.Error(w, "ts_ms must be a non-negative integer (ms since epoch)", http.StatusBadRequest)
+		return
+	}
+	bmp, effTs, err := s.svc.FrameAt(ts)
+	if err != nil {
+		s.log.Error("history frame", "err", err, "tsMs", ts)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"tsMs": effTs, "bmp": bmp})
 }
 
 // ---- claims ----

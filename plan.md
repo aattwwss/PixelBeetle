@@ -114,8 +114,8 @@ previously planned custom batching layer was dropped.
 | 1 | Infra: TB ×3 (+ RabbitMQ) | ✅ TB native scripts + RabbitMQ podman script; compose stale |
 | 2 | Core server: accounts, pending→post/void, locks, cache | ✅ done; v2 model puts exclusivity inside TB |
 | 3 | Web UI: SSR grid + DataStar SSE | ✅ basic loop works; polish (palette picker, countdown HUD) open |
-| 4 | CDC consumer + replay service + slider UI | ✅ consumer live-verified (multi-server sync); slider UI not started |
-| 5 | Cache recovery (snapshot + catch-up on boot) | ✅ query_transfers warm-up live-verified |
+| 4 | CDC consumer + timelapse view | ✅ CDC live-verified; timelapse redesigned (2026-08-31): separate /history page, every frame = live TB query (anchor checkpoint + ≤1 minute of ledger), no client-side manifest |
+| 5 | Cache recovery (snapshot + catch-up on boot) | ✅ PBSSNAP2 snapshot (bitmap + warmTs + anchor grid) → 738ms boot vs 32m full replay on an 18M-transfer ledger; evicted checkpoints spill to an append-only sidecar so old timelapse seeks stay cheap |
 | 6 | Load gen + live dashboard | ✅ both done (2026-08-26): bot `-grid` full-canvas capable; server-side atomic counters + bot heartbeat merged into a `metrics` signal broadcast over the SSE hub every 1s; `#metrics-panel` with claims/s, confirms/s, locks, pixels, viewers, bot p50/p99/conflicts |
 | 7 | Fault-tolerance demo script (kill replica mid-load) | ✅ `scripts/fault-demo.sh` (2026-08-26): runs load, kill -9 a follower, proves claims confirm through the quorum, restarts + rejoins; kill is PID-based (avoids pkill self-match) |
 

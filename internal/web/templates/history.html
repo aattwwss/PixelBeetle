@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>PixelBeetle — Timelapse</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="history">
+  <header>
+    <h1>PixelBeetle <span class="tagline">— timelapse</span></h1>
+    <p class="tagline">every frame is a live TigerBeetle query: anchor bitmap + one minute of ledger</p>
+    <a class="nav" href="/">← back to the canvas</a>
+  </header>
+
+  <div id="canvas-wrap">
+    <canvas id="hgrid" width="{{.Cols}}" height="{{.Rows}}"></canvas>
+  </div>
+
+  <div id="history-bar">
+    <input type="range" id="tslider" class="slider" min="0" max="0" value="0" disabled>
+    <span class="time-label" id="tlabel">loading…</span>
+    <span id="hstatus"></span>
+  </div>
+
+  <script src="/static/palette.js"></script>
+  <script src="/static/history.js"></script>
+</body>
+</html>

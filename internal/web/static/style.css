@@ -5,8 +5,13 @@ body { margin: 0; font-family: system-ui, sans-serif; background: #111; color: #
 header { padding: .5rem 1rem; display: flex; align-items: baseline; gap: 1rem; flex-wrap: wrap; }
 h1 { font-size: 1.2rem; margin: 0; }
 .tagline { color: #888; font-size: .8rem; margin: 0; }
-#hud button { margin-left: .5rem; cursor: pointer; }
-#hud .countdown { font-size: .8rem; color: #ffd600; }
+#hud button { margin-left: .5rem; cursor: pointer; padding: .35rem .8rem; }
+#hud .countdown { font-size: .8rem; color: #ffd600; white-space: nowrap; }
+/* Reserve the claim UI's full box (height AND width) even while #hud is
+   empty, and take it out of the header's baseline group (align-self:center):
+   an empty inline-flex has a different baseline than one filled with text,
+   which re-laid-out the whole header row every time a claim started. */
+#hud { min-height: 2rem; min-width: 290px; display: inline-flex; align-items: center; align-self: center; }
 
 /* palette color picker */
 #palette {
@@ -112,4 +117,62 @@ h1 { font-size: 1.2rem; margin: 0; }
 .time-label {
   font-size: .8rem; color: #aaa; white-space: nowrap;
   font-variant-numeric: tabular-nums;
+}
+
+/* history page (timelapse) */
+.nav {
+  color: #ffd600;
+  text-decoration: none;
+  font-size: 0.9rem;
+  margin-left: 12px;
+}
+.nav:hover { text-decoration: underline; }
+#history-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  max-width: 900px;
+  margin: 12px auto 0;
+}
+/* min-height reserves this cell's line even when the text is empty —
+   otherwise "querying…" appearing/disappearing makes the bar height pulse. */
+#hstatus { color: #ffd600; font-size: 0.85rem; min-width: 120px; min-height: 1.3em; }
+
+/* Timelapse page layout: the whole page is exactly the viewport (no
+   scrolling anywhere) and the canvas fills the leftover space between the
+   header and the slider bar, letterboxed/centered via object-fit. Scoped
+   under body.history so the homepage canvas styles are untouched. */
+body.history {
+  height: 100vh;
+  height: 100dvh;        /* mobile URL-bar aware viewport height */
+  overflow: hidden;      /* the page itself must never scroll */
+  display: flex;
+  flex-direction: column;
+}
+body.history header { flex: none; }
+body.history #canvas-wrap {
+  flex: 1 1 0;           /* claim all space between header and slider bar */
+  min-height: 0;         /* allow shrinking below content size */
+  position: relative;
+  overflow: hidden;
+  max-height: none;
+}
+#hgrid {
+  /* The canvas element stays 256x256 internally (putImageData draws at
+     native resolution); CSS stretches the element across the whole wrap and
+     object-fit: contain letterboxes the bitmap to the largest size that
+     still shows the entire canvas, centered both ways. pixelated keeps
+     cells crisp when upscaled. */
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  image-rendering: pixelated;
+  background: #1c1c1c;
+}
+body.history #history-bar {
+  max-width: min(1400px, 96vw);
+  width: 96vw;
+  margin: 10px auto 14px;
 }

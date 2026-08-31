@@ -6,12 +6,13 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <link rel="stylesheet" href="/static/style.css">
 </head>
-<body data-signals="{bmp: null, deltas: [], lockAdds: [], lockRemoves: [], locks: [], metrics: {}, tsMs: {{.MaxTsMs}}}">
+<body data-signals="{bmp: null, deltas: [], lockAdds: [], lockRemoves: [], locks: [], metrics: {}}">
   <header>
     <h1>PixelBeetle</h1>
     <p class="tagline">every pixel is a TigerBeetle transfer</p>
     <div id="palette"></div>
     <div id="hud"></div>
+    <a class="nav" href="/history">⏳ Timelapse</a>
   </header>
 
   <div id="canvas-wrap">
@@ -32,16 +33,8 @@
     <span class="bot" data-show="$metrics.botP99Ms != null">bot p50 <b data-text="$metrics.botP50Ms"></b>ms · p99 <b data-text="$metrics.botP99Ms"></b>ms · conflicts <b data-text="$metrics.botConflicts"></b></span>
   </footer>
 
-  <footer id="replay-bar">
-    <button class="live-btn" data-on:click="pb.live()">⏵ Live</button>
-    <span class="replay-badge" data-show="$tsMs < {{.MaxTsMs}}">◀ REPLAY</span>
-    <input type="range" class="slider" min="{{.MinTsMs}}" max="{{.MaxTsMs}}" value="{{.MaxTsMs}}"
-           data-bind="tsMs"
-           data-on:input__throttle.80ms="pb.scrub(evt.target.value)">
-    <span class="time-label" data-text="new Date($tsMs).toLocaleString()"></span>
-  </footer>
-
   <script id="initial-state" type="application/json">{{.InitialJSON}}</script>
+  <script src="/static/palette.js"></script>
   <script type="module" src="/static/datastar.js"></script>
   <script src="/static/app.js"></script>
 </body>
