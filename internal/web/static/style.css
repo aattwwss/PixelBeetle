@@ -12,6 +12,12 @@ h1 { font-size: 1.2rem; margin: 0; }
    an empty inline-flex has a different baseline than one filled with text,
    which re-laid-out the whole header row every time a claim started. */
 #hud { min-height: 2rem; min-width: 290px; display: inline-flex; align-items: center; align-self: center; }
+#coords {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+  color: #888;
+  margin-left: 12px;
+}
 
 /* palette color picker */
 #palette {
@@ -58,10 +64,15 @@ h1 { font-size: 1.2rem; margin: 0; }
 }
 /* Lock overlay: sits exactly on #grid, draws yellow border boxes for pending
    claims. pointer-events:none so clicks pass through to #grid; no pixelated
-   rendering so the strokeRect borders anti-alias smoothly. */
+   rendering so the strokeRect borders anti-alias smoothly.
+   width/height:100% is REQUIRED: a <canvas> is a replaced element, so
+   position:absolute + inset:0 does NOT stretch it (used size falls back to
+   the 300x150 attribute default — the overlay silently misaligned). */
 #lock-overlay {
   position: absolute;
   inset: 0;
+  width: 100%;
+  height: 100%;
   pointer-events: none;
 }
 

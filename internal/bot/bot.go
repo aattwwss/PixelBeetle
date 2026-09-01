@@ -1,6 +1,8 @@
-// Package bot is the PixelBeetle load generator: N agent goroutines claim and
-// confirm random cells at a shared rate to demonstrate TigerBeetle throughput
-// and measure latency, lock conflicts and expiry rates under load.
+// Package bot is the PixelBeetle load generator and painter: N agent
+// goroutines claim and confirm random cells at a shared rate to demonstrate
+// TigerBeetle throughput and measure latency, lock conflicts and expiry rates
+// under load (load mode), or paint a blueprint pixel-by-pixel through the
+// same claim→confirm cycle (paint mode, -paint — see draw-plan.md).
 //
 // Modes:
 //   - api:    HTTP against the game server (end-to-end: locks, cache, SSE)
@@ -58,6 +60,16 @@ type Config struct {
 	Abandon  float64       // fraction of claims never confirmed (~0.10 default)
 	ThinkMin time.Duration // min confirm delay
 	ThinkMax time.Duration // max confirm delay
+
+	// Paint mode (non-empty BlueprintPath or Draws switches Run from load to paint).
+	BlueprintPath  string    // -paint source: .txt art file, or image (.png/.jpg/.jpeg/.gif)
+	Draws          []string  // -draw shape specs (rect/fillrect/circle/line/text), composed in order
+	PaintSize      [2]uint32 // image → blueprint target box
+	PaintSizeSet   bool      // false → default to the grid size
+	PaintOffset    [2]uint32 // top-left anchor on the canvas
+	PaintOffsetSet bool      // false → center the drawing automatically
+	PaintWorkers   int       // parallel claim workers
+	PaintOrder     string    // "scanline" (default) | "random"
 }
 
 type Metrics struct {
@@ -66,6 +78,8 @@ type Metrics struct {
 	Voided        atomic.Uint64
 	LockConflicts atomic.Uint64
 	Errors        atomic.Uint64
+	Painted       atomic.Uint64 // paint mode: placements successfully confirmed
+	Total         uint64        // paint mode: total placements (set once, read-only after)
 	latencies     []float64
 	latMu         sync.Mutex
 }
@@ -91,6 +105,18 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) (*Metrics, error) {
 		cfg.GridH = 256
 	}
 
+	// Paint mode: compile the input (file art or image, plus -draw specs) up
+	// front so a malformed or off-canvas drawing fails before anything is
+	// claimed.
+	var bp *Blueprint
+	if cfg.BlueprintPath != "" || len(cfg.Draws) > 0 {
+		b, err := LoadPaint(cfg)
+		if err != nil {
+			return nil, fmt.Errorf("bot: load paint: %w", err)
+		}
+		bp = &b
+	}
+
 	var (
 		direct *tbclient.Client
 		err    error
@@ -106,21 +132,17 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) (*Metrics, error) {
 		// game server to do this, so provision the whole canvas up front
 		// (idempotent; fast on re-run since exists == ok). This keeps the
 		// measured claim/confirm latency free of account-creation noise.
-		log.Info("bot: provisioning pixel accounts (direct mode)", "grid", fmt.Sprintf("%dx%d", cfg.GridW, cfg.GridH), "count", int(cfg.GridW)*int(cfg.GridH))
-		if err := direct.EnsureAllPixels(cfg.GridW, cfg.GridH); err != nil {
-			return nil, fmt.Errorf("bot: ensure all pixels: %w", err)
+		// Paint mode provisions only the blueprint's pixels (inside paintRun,
+		// after the offset is resolved).
+		if bp == nil {
+			log.Info("bot: provisioning pixel accounts (direct mode)", "grid", fmt.Sprintf("%dx%d", cfg.GridW, cfg.GridH), "count", int(cfg.GridW)*int(cfg.GridH))
+			if err := direct.EnsureAllPixels(cfg.GridW, cfg.GridH); err != nil {
+				return nil, fmt.Errorf("bot: ensure all pixels: %w", err)
+			}
 		}
 	}
 
 	httpc := &http.Client{Timeout: 5 * time.Second}
-	// playerIDs are the per-agent identities used in DIRECT mode (where the
-	// bot writes straight to TigerBeetle via tbclient.NewClaim). In API mode the
-	// server mints the identity itself via the signed player_id cookie captured
-	// by each agent's cookie jar, so these UUIDs are never sent over HTTP.
-	playerIDs := make([]uuid.UUID, cfg.Players)
-	for i := range playerIDs {
-		playerIDs[i] = uuid.Must(uuid.NewV7())
-	}
 
 	ctx, cancel := context.WithCancel(ctx)
 	if cfg.Duration > 0 {
@@ -142,7 +164,7 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) (*Metrics, error) {
 				case <-t.C:
 				}
 				p50, p99 := m.LatencyReport()
-				body, _ := json.Marshal(map[string]any{
+				payload := map[string]any{
 					"claims":    m.ClaimsStarted.Load(),
 					"confirmed": m.Confirmed.Load(),
 					"conflicts": m.LockConflicts.Load(),
@@ -150,7 +172,12 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) (*Metrics, error) {
 					"p50Ms":     p50,
 					"p99Ms":     p99,
 					"rps":       cfg.RPS,
-				})
+				}
+				if bp != nil { // paint mode: additive keys; the server ignores unknowns
+					payload["painted"] = m.Painted.Load()
+					payload["total"] = m.Total
+				}
+				body, _ := json.Marshal(payload)
 				req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.Target+"/admin/bots", bytes.NewReader(body))
 				if err != nil {
 					continue
@@ -161,6 +188,21 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) (*Metrics, error) {
 				}
 			}
 		}()
+	}
+
+	// Paint mode: everything below is the load generator. The painter has its
+	// own worker pool and rejects the load-mode knobs (abandon, think time).
+	if bp != nil {
+		return paintRun(ctx, cfg, log, m, *bp, direct, httpc)
+	}
+
+	// playerIDs are the per-agent identities used in DIRECT mode (where the
+	// bot writes straight to TigerBeetle via tbclient.NewClaim). In API mode the
+	// server mints the identity itself via the signed player_id cookie captured
+	// by each agent's cookie jar, so these UUIDs are never sent over HTTP.
+	playerIDs := make([]uuid.UUID, cfg.Players)
+	for i := range playerIDs {
+		playerIDs[i] = uuid.Must(uuid.NewV7())
 	}
 
 	var wg sync.WaitGroup

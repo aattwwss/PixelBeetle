@@ -20,6 +20,17 @@ let olCanvas, olCtx; // lock overlay: yellow border boxes drawn above the bitmap
 let liveBmp = null;      // Uint8Array W*H (bitmap values 0..16)
 let lockSet = new Set(); // "x,y" strings currently locked
 let currentClaimId = null;
+let pendingCell = null; // {x, y} of the cell we hold a claim on, if any
+
+// clearHud drops the confirm/cancel panel — but only if `claimId` is still the
+// claim that owns the HUD (a stale expiry timer or unlock for a superseded
+// claim must not clobber a newer one).
+function clearHud(claimId) {
+  if (currentClaimId !== claimId) return;
+  currentClaimId = null;
+  pendingCell = null;
+  document.getElementById('hud').innerHTML = '';
+}
 
 // Reference tracking so each signal value is applied exactly once (a flush
 // that changes lockAdds but not deltas must not re-apply the stale deltas).
@@ -82,7 +93,7 @@ function init() {
       }
       if (Array.isArray(s.locks)) {
         lockSet = new Set(s.locks.map(([x, y]) => `${x},${y}`));
-        renderFull();
+        renderLocks();
       }
     } catch (e) {
       console.warn('initial state parse failed', e);
@@ -90,7 +101,24 @@ function init() {
   }
 
   canvas.addEventListener('click', onCanvasClick);
+
+  // Live coordinate readout: hover shows the pixel under the cursor.
+  canvas.addEventListener('mousemove', onCanvasHover);
+  canvas.addEventListener('mouseleave', () => updateCoords(-1, -1));
   buildPalette();
+}
+
+function onCanvasHover(evt) {
+  const rect = canvas.getBoundingClientRect();
+  const x = Math.floor((evt.clientX - rect.left) / rect.width * cols);
+  const y = Math.floor((evt.clientY - rect.top) / rect.height * rows);
+  updateCoords(x, y);
+}
+
+function updateCoords(x, y) {
+  const el = document.getElementById('coords');
+  if (!el) return;
+  el.textContent = (x >= 0 && y >= 0 && x < cols && y < rows) ? `(${x}, ${y})` : '';
 }
 
 // ---- input: click -> claim (two-phase: claim, then confirm/cancel in HUD) ----
@@ -116,11 +144,16 @@ async function claim(x, y) {
   }
   const { claimId } = await res.json();
   currentClaimId = claimId;
+  pendingCell = { x, y };
   const hud = document.getElementById('hud');
   hud.innerHTML = `
     <span class="countdown">confirm within 3s…</span>
     <button onclick="pb.confirm()">paint it</button>
     <button onclick="pb.cancel()">cancel</button>`;
+  // Server-truth cleanup comes via lockRemoves (below); this timer is the
+  // fallback if the SSE unlock is missed (drop, reconnect, backgrounded tab).
+  // 3s claim window + small grace for the flush interval.
+  setTimeout(() => clearHud(claimId), 3200);
 }
 
 pb.confirm = async function () { await resolveClaim('/confirm'); };
@@ -186,12 +219,10 @@ function drawLock(x, y) {
   olCtx.strokeRect(x * cw + lw / 2, y * cw + lw / 2, cw - lw, cw - lw);
 }
 
-function clearLock(x, y) {
-  if (!olCtx) return;
-  const cw = cellW();
-  olCtx.clearRect(x * cw, y * cw, cw, cw);
-}
-
+// No per-cell clear: cellW is fractional, so an anti-aliased stroke leaves an
+// alpha fringe that spills past the cell rect and clearRect can't remove it
+// (residue accumulates into a yellow silhouette). renderLocks() clears the
+// whole overlay and re-strokes every lock — the only mutation path.
 function renderLocks() {
   if (!olCtx) return;
   olCtx.clearRect(0, 0, olCanvas.width, olCanvas.height);
@@ -222,17 +253,22 @@ pb.render = function (bmp, deltas, lockAdds, lockRemoves, locks) {
   if (locks !== lastLocks) {
     lastLocks = locks;
     lockSet = new Set((locks || []).map(([x, y]) => `${x},${y}`));
-    renderFull();
+    renderLocks();
   }
   if (lockAdds && lockAdds !== lastLockAdds) {
     lastLockAdds = lockAdds;
     for (const [x, y] of (lockAdds || [])) lockSet.add(`${x},${y}`);
-    for (const [x, y] of (lockAdds || [])) drawLock(x, y);
+    renderLocks();
   }
   if (lockRemoves && lockRemoves !== lastLockRemoves) {
     lastLockRemoves = lockRemoves;
-    for (const [x, y] of (lockRemoves || [])) clearLock(x, y);
     for (const [x, y] of (lockRemoves || [])) lockSet.delete(`${x},${y}`);
+    renderLocks();
+    // If one of the unlocks is OUR pending cell, the claim expired or was
+    // reaped — retire the confirm/cancel HUD immediately.
+    if (pendingCell && (lockRemoves || []).some(([x, y]) => x === pendingCell.x && y === pendingCell.y)) {
+      clearHud(currentClaimId);
+    }
   }
 };
 

@@ -1,9 +1,10 @@
-.PHONY: help up down serve bot db-up db-down broker-up broker-down cdc-up cdc-down build test fmt vet tidy
+.PHONY: help up down reset serve bot db-up db-down broker-up broker-down cdc-up cdc-down build test fmt vet tidy
 
 help:
 	@echo "make up        - start dependencies: TigerBeetle cluster (db) + RabbitMQ (broker) + CDC job"
 	@echo "make serve     - run the game server in the foreground (:8080, 256x256 by default)"
 	@echo "make down      - stop everything"
+	@echo "make reset     - stop everything and wipe data/ — clean slate (fresh TB format, empty canvas)"
 	@echo "make bot RPS=100 DURATION=30s [PLAYERS=64] [GRID=256x256] - run load generator"
 	@echo "make serve GRID=1000x1000     - 1M-pixel showcase (provisions 1M accounts at startup)"
 	@echo "make bot   GRID=1000x1000      - load gen against a 1M canvas (must match the server)"
@@ -58,6 +59,15 @@ bot:
 	go run ./cmd/bot -target $(or $(TARGET),http://localhost:8080) \
 	  -grid $(or $(GRID),256x256) \
 	  -rps $(or $(RPS),100) -duration $(or $(DURATION),30s) -players $(or $(PLAYERS),64)
+
+reset: ## stop everything and wipe all game state (TB ledger, snapshots, test leftovers, logs)
+	-./scripts/server.sh stop
+	-./scripts/cdc.sh stop
+	-./scripts/rabbitmq.sh stop
+	-./scripts/tigerbeetle.sh stop
+	rm -f data/dev_*.tigerbeetle data/snapshot.bin data/snapshot.bin.anchors
+	rm -rf data/live-* data/logs/*
+	@echo "data/ wiped — 'make up' reformats a fresh cluster; then 'scripts/server.sh start'"
 
 build:
 	go build ./...

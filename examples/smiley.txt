@@ -1,0 +1,11 @@
+legend: k=#222222 w=#ffffff
+....kkkk....
+..kkkkkkkk..
+.kkkkkkkkkk.
+.kkwkkkkwkk.
+.kkkkkkkkkk.
+.kkkkkkkkkk.
+.kkwwwwwwkk.
+.kkkkkkkkkk.
+..kkkkkkkk..
+....kkkk....

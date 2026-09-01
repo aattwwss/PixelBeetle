@@ -64,6 +64,7 @@ func (s *Server) Routes() http.Handler {
 	}
 	mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.FS(staticRoot))))
 	mux.HandleFunc("GET /sse", s.handleSSE)
+	mux.HandleFunc("GET /api/canvas", s.handleCanvas)   // current canvas state for `bot -preview`
 	mux.HandleFunc("GET /history", s.handleHistoryPage) // timelapse view (separate page; the canvas homepage stays history-free)
 	mux.HandleFunc("GET /api/history/meta", s.handleHistoryMeta)
 	mux.HandleFunc("GET /api/history/frame", s.handleHistoryFrame)
@@ -125,6 +126,21 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 	s.hub.ServeSSE(w, r, s.svc.SnapshotBmp)
+}
+
+// handleCanvas returns the current full canvas state — base64 packed bitmap,
+// active locks, grid dims — the same snapshot an SSE subscriber receives on
+// connect. Lets `bot -preview` overlay a blueprint and show collisions
+// before painting a single claim.
+func (s *Server) handleCanvas(w http.ResponseWriter, r *http.Request) {
+	bmp, locks := s.svc.SnapshotBmp()
+	gw, gh := s.svc.Grid()
+	writeJSON(w, map[string]any{
+		"gridW": gw,
+		"gridH": gh,
+		"bmp":   bmp,
+		"locks": locks,
+	})
 }
 
 // ---- history (timelapse view) ----

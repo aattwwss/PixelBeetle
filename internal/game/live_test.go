@@ -84,7 +84,7 @@ func startLiveCluster() {
 		ln.Close()
 	}
 
-	dir, err := os.MkdirTemp("", "pixelbeetle-live-")
+	dir, err := os.MkdirTemp("../../data", "live-game-") // disk-backed: each replica needs ~1GiB, too big for tmpfs (/tmp)
 	if err != nil {
 		fmt.Println("game/live: skipping (temp dir:", err, ")")
 		return

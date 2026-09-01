@@ -21,13 +21,17 @@ start() {
     # Best-effort: on re-runs the dir is owned by the container's mapped uid
     # and chmod fails with EPERM — ownership is then already correct anyway.
     chmod 0777 "$DATA_DIR" 2>/dev/null || true
-    if ! podman run -d --name "$NAME" \
+    # --cgroups=disabled + --events-backend=file: these bypass the systemd
+    # user manager (dbus/cgroup delegation). Harmless when the session is
+    # healthy; keeps `make up` working when it isn't (e.g. after a stale
+    # login session — podman fails with "crun: sd-bus call: Access denied").
+    if ! podman run -d --cgroups=disabled --events-backend=file --name "$NAME" \
        -v "$DATA_DIR:/var/lib/rabbitmq" \
        -p 5672:5672 -p "$HTTP_PORT:15672" \
        docker.io/library/rabbitmq:3-management >/dev/null; then
       # Transient failures happen right after a rm (port release lag) — retry.
       sleep 3
-      podman run -d --name "$NAME" \
+      podman run -d --cgroups=disabled --events-backend=file --name "$NAME" \
         -v "$DATA_DIR:/var/lib/rabbitmq" \
         -p 5672:5672 -p "$HTTP_PORT:15672" \
         docker.io/library/rabbitmq:3-management || { echo "podman run failed" >&2; exit 1; }

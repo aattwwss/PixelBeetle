@@ -1,0 +1,9 @@
+legend: b=#4363d8 w=#ffffff
+.bbbbbbbbbbbb.
+.bwwwwwwwwwwb.
+.bwbbbbbbbbwb.
+.bwbwwwwwwbwb.
+.bwbwwwwwwbwb.
+.bwbbbbbbbbwb.
+.bwwwwwwwwwwb.
+.bbbbbbbbbbbb.

@@ -22,6 +22,41 @@ scripts/rabbitmq.sh status    # RabbitMQ (podman) — auto-started by cdc.sh
 
 Web UI: http://localhost:8080. Load test: `go build -o bin/bot ./cmd/bot && ./bin/bot -target http://localhost:8080 -rps 100`.
 
+### Paint mode (draw a blueprint, pixel by pixel)
+
+The bot can paint a text-art blueprint, a hand-composed drawing, or an image
+on the canvas through the same claim→confirm cycle, so the history timelapse
+shows the picture emerging. See `draw-plan.md` for the blueprint format,
+shape syntax, and image pipeline.
+
+```sh
+go build -o bin/bot ./cmd/bot
+./bin/bot -paint examples/smiley.txt                # text art, centered, 16 workers
+./bin/bot -paint examples/tb-box.txt -paint-offset 10,40   # place it
+./bin/bot -paint examples/beetle.txt -paint-order random  # developing-photo effect
+./bin/bot -paint photo.png                          # image → 16-color conversion
+./bin/bot -paint photo.png -inspect > art.txt       # review/export as text art first
+./bin/bot -preview examples/smiley.txt -paint-offset 10,40   # overlay on the live canvas, print ASCII, no claims
+./bin/bot -draw "rect:1,1,18,9,#4363d8" -draw "text:3,3,TB,#ffd600"   # shapes only
+```
+
+`-preview` fetches the current canvas and shows placement + collisions before
+painting: lowercase = existing pixels, UPPERCASE = what will be painted,
+`X` = overpaint, `.` = empty. Combine with the canvas coordinate readout
+(hover the live canvas at `/` for `x,y`) to pick your spot.
+
+Flags: `-paint` (`.txt` art or `.png/.jpg/.jpeg/.gif` image), `-draw`
+(repeatable shape specs: `rect`/`fillrect` `x,y,w,h` · `circle` `cx,cy,r` ·
+`line` `x0,y0,x1,y1` · `text` `x,y,String` — each followed by `,#hex`),
+`-paint-size WxH` (image target box; default fits the grid, aspect-preserving),
+`-paint-offset x,y` (default: centered), `-paint-workers N` (default 16; the
+shared `-rps` flag acts as a global cap when > 0), `-paint-order
+scanline|random`, `-inspect` (print the blueprint as text art and exit),
+`-preview` (same inputs as `-paint`, but fetch the canvas, overlay, print
+ASCII, place no claims).
+Pixels held by other players are retried up to 3× after the claim window,
+then skipped.
+
 ## Run (deploy, Docker)
 
 `docker-compose.yml` is a deployable, corrected spec for environments with a
@@ -60,7 +95,7 @@ and prints a PASSED transcript.
 
 ```
 cmd/server     game server entry point
-cmd/bot        load generator entry point
+cmd/bot        load generator + painter entry point (see Paint mode above)
 internal/tbclient  TigerBeetle wrapper + claim construction (shared by server & bots)
 internal/game      pixel cache, lock table, claim service
 internal/hub       DataStar SSE broadcast hub
