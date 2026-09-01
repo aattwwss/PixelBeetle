@@ -73,9 +73,10 @@ func TestParseMessageNonClaimEvent(t *testing.T) {
 	}
 }
 
-// The producer emits ONE format (decimal strings). A bare JSON number is a
-// loud parse error, not a silently-tolerated second format.
-func TestParseMessageRejectsBareNumberU128s(t *testing.T) {
+// The producer emits BOTH encodings on the wire (live-verified 2026-09-01:
+// the strings-only parser rejected real events with "u128 must be a decimal
+// JSON string, got 1"). Bare numbers must parse correctly, not error.
+func TestParseMessageBareNumberU128s(t *testing.T) {
 	pixelID := tbclient.PixelID(7, 8).BigInt().String()
 	body := fmt.Sprintf(`{
 		"timestamp":1787682583188303702,
@@ -85,8 +86,30 @@ func TestParseMessageRejectsBareNumberU128s(t *testing.T) {
 		"debit_account":{"id":%s,"code":1000,"flags":2,"timestamp":1787682583188303702},
 		"credit_account":{"id":1,"code":999,"flags":0,"timestamp":1787682583188303702}
 	}`, pixelID)
+	ev, err := ParseMessage([]byte(body))
+	if err != nil {
+		t.Fatalf("bare-number u128s must parse: %v", err)
+	}
+	if ev.Type != TypePosted {
+		t.Fatalf("want type posted, got %q", ev.Type)
+	}
+	if ev.X != 7 || ev.Y != 8 || ev.Color != 9 {
+		t.Fatalf("want pixel (7,8) color 9, got (%d,%d,%d)", ev.X, ev.Y, ev.Color)
+	}
+}
+
+func TestParseMessageRejectsOversizedU128(t *testing.T) {
+	big := strings.Repeat("9", 64) // > 2^128
+	body := fmt.Sprintf(`{
+		"timestamp":"1787682583188303703",
+		"type":"two_phase_posted",
+		"ledger":1,
+		"transfer":{"id":"%s","amount":"1","pending_id":"0","user_data_128":"0","code":1000,"flags":5,"timestamp":"1787682583188303703"},
+		"debit_account":{"id":"1","code":1000,"flags":2,"timestamp":"1787682583188303703"},
+		"credit_account":{"id":"1","code":999,"flags":0,"timestamp":"1787682583188303703"}
+	}`, big)
 	if _, err := ParseMessage([]byte(body)); err == nil {
-		t.Fatal("want parse error for bare-number u128s, got nil")
+		t.Fatal("want parse error for out-of-range u128, got nil")
 	}
 }
 

@@ -11,11 +11,11 @@ import (
 	"pixelbeetle/internal/tbclient"
 )
 
-// cdcU128 decodes a TigerBeetle u128 from its decimal JSON string — the one
-// encoding the pinned `tigerbeetle amqp` CDC producer emits. A future
-// encoder change should surface here as a loud parse error (which the
-// consumer acks as a poison pill) rather than as silent tolerance of a
-// second format.
+// cdcU128 decodes a TigerBeetle u128 from either encoding the
+// `tigerbeetle amqp` CDC producer emits on the wire: a decimal JSON string
+// (captured fixtures) or a bare JSON number (live-verified 2026-09-01 — the
+// strings-only parser rejected real events; see feedback.md #15). Anything
+// else is a loud parse error, which the consumer acks as a poison pill.
 type cdcU128 struct {
 	V tb.Uint128
 }
@@ -25,19 +25,25 @@ func (f *cdcU128) UnmarshalJSON(b []byte) error {
 		f.V = tb.ToUint128(0)
 		return nil
 	}
-	var s string
-	if err := json.Unmarshal(b, &s); err != nil {
-		return fmt.Errorf("replay: u128 must be a decimal JSON string, got %s", b)
+	s := string(b)
+	if b[0] == '"' {
+		if err := json.Unmarshal(b, &s); err != nil {
+			return fmt.Errorf("replay: invalid u128 string %s", b)
+		}
 	}
 	bi, ok := new(big.Int).SetString(s, 10)
-	if !ok {
-		return fmt.Errorf("replay: invalid u128 decimal string %q", s)
+	if !ok || bi.Sign() < 0 {
+		return fmt.Errorf("replay: invalid u128 decimal %q", s)
+	}
+	if bi.BitLen() > 128 {
+		return fmt.Errorf("replay: u128 out of range %q", s)
 	}
 	f.V = tb.BigIntToUint128(bi)
 	return nil
 }
 
-// cdcU64 decodes a u64 from its decimal JSON string (see cdcU128).
+// cdcU64 decodes a u64 from a decimal string or a bare JSON number (see
+// cdcU128). ParseUint's range check covers overflow in both forms.
 type cdcU64 uint64
 
 func (f *cdcU64) UnmarshalJSON(b []byte) error {
@@ -45,13 +51,15 @@ func (f *cdcU64) UnmarshalJSON(b []byte) error {
 		*f = 0
 		return nil
 	}
-	var s string
-	if err := json.Unmarshal(b, &s); err != nil {
-		return fmt.Errorf("replay: u64 must be a decimal JSON string, got %s", b)
+	s := string(b)
+	if b[0] == '"' {
+		if err := json.Unmarshal(b, &s); err != nil {
+			return fmt.Errorf("replay: invalid u64 string %s", b)
+		}
 	}
 	v, err := strconv.ParseUint(s, 10, 64)
 	if err != nil {
-		return fmt.Errorf("replay: invalid u64 decimal string %q: %w", s, err)
+		return fmt.Errorf("replay: invalid u64 decimal %q: %w", s, err)
 	}
 	*f = cdcU64(v)
 	return nil
