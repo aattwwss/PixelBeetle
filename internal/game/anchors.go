@@ -127,12 +127,16 @@ func (g *anchorGrid) insert(tsMs int64, curBmp []byte) {
 // refs; pool bitmaps nothing references anymore are freed.
 func (g *anchorGrid) evict() {
 	drop := 0
-	for len(g.list) > anchorMax || (g.poolBytes > maxAnchorPoolSize && len(g.list) > 1) {
+	if len(g.list) > anchorMax {
+		// Entry cap: evict exactly the overflow. Arithmetic, deliberately not
+		// a creeping loop — a loop whose body never changes its condition
+		// grows drop to len(list)-1 and mass-evicts to a single entry.
+		drop = len(g.list) - anchorMax
+	}
+	// Byte cap: keep evicting one per insert until the pool fits under the
+	// cap, but never evict the final entry (the last bitmap always fits).
+	for g.poolBytes > maxAnchorPoolSize && len(g.list)-drop > 1 {
 		drop++
-		if drop > len(g.list)-1 { // never evict everything
-			drop = len(g.list) - 1
-			break
-		}
 	}
 	if drop == 0 {
 		return
@@ -184,18 +188,10 @@ func (g *anchorGrid) sidecarAt(tsMs int64) (anchorRef, bool) {
 	return best, found
 }
 
-// atOrBefore returns the newest checkpoint at or before tsMs. The returned
-// slice is SHARED with the pool — callers must copy before mutating. ok is
-// false when tsMs predates every retained checkpoint (the caller then folds
-// from an empty canvas).
-func (g *anchorGrid) atOrBefore(tsMs int64) ([]byte, bool) {
-	bmp, _, ok := g.checkpoint(tsMs)
-	return bmp, ok
-}
-
-// checkpoint is atOrBefore plus the checkpoint's ns boundary: the bitmap
-// covers every event strictly before startNs, so the delta query for a frame
-// at T begins exactly there (QueryCanvasTransfers is TimestampMin-inclusive).
+// checkpoint returns the newest retained anchor at/before tsMs plus its ns
+// boundary: the bitmap covers every event strictly before startNs, so the
+// delta query for a frame at T begins exactly there
+// (QueryCanvasTransfers is TimestampMin-inclusive).
 func (g *anchorGrid) checkpoint(tsMs int64) (bmp []byte, startNs uint64, ok bool) {
 	// list is ascending by construction (syncTo appends increasing bounds).
 	lo, hi := 0, len(g.list)

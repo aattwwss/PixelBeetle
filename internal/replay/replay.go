@@ -11,6 +11,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/google/uuid"
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -46,7 +47,6 @@ type Sink interface {
 type Config struct {
 	AMQPURL  string // amqp://guest:guest@localhost:5672/
 	Exchange string // must pre-exist (declared by scripts/rabbitmq.sh)
-	Queue    string // optional; empty uses a server-named queue
 	Log      *slog.Logger
 }
 
@@ -64,10 +64,39 @@ func NewConsumer(cfg Config, sink Sink) *Consumer {
 	return &Consumer{cfg: cfg, sink: sink, log: log}
 }
 
-// Run connects, verifies the exchange, consumes, and pumps events until ctx is
-// cancelled or a fatal connection error occurs. It does not auto-reconnect:
-// callers that want resilience should restart it on error.
+// reconnectBackoffMin is the initial wait after a connection error before
+// re-dialing; reconnectBackoffMax caps its exponential growth.
+const (
+	reconnectBackoffMin = time.Second
+	reconnectBackoffMax = 30 * time.Second
+)
+
+// Run consumes the CDC stream until ctx is cancelled, reconnecting with
+// capped exponential backoff after transient connection errors, so a single
+// RabbitMQ blip can't silently end the pipeline. Returns ctx.Err() on
+// cancellation — a clean stop, not a failure.
 func (c *Consumer) Run(ctx context.Context) error {
+	backoff := reconnectBackoffMin
+	for {
+		err := c.runOnce(ctx)
+		if err == nil || ctx.Err() != nil {
+			return ctx.Err()
+		}
+		c.log.Warn("replay: connection lost; reconnecting", "err", err, "backoff", backoff)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoff):
+		}
+		if backoff < reconnectBackoffMax {
+			backoff *= 2
+		}
+	}
+}
+
+// runOnce dials, binds a per-instance exclusive queue to the fanout exchange,
+// and consumes until the context is cancelled or the connection breaks.
+func (c *Consumer) runOnce(ctx context.Context) error {
 	conn, err := amqp.Dial(c.cfg.AMQPURL)
 	if err != nil {
 		return fmt.Errorf("replay: dial: %w", err)
@@ -85,8 +114,10 @@ func (c *Consumer) Run(ctx context.Context) error {
 		return fmt.Errorf("replay: exchange %q must pre-exist: %w", c.cfg.Exchange, err)
 	}
 
-	queueName := c.cfg.Queue
-	q, err := ch.QueueDeclare(queueName, false, true, true, false, nil)
+	// Server-named, exclusive, auto-delete queue: each instance gets its own
+	// copy of the fanout and the queue disappears on disconnect. A shared
+	// named queue would make a second instance fail with RESOURCE_LOCKED.
+	q, err := ch.QueueDeclare("", false, true, true, false, nil)
 	if err != nil {
 		return fmt.Errorf("replay: queue declare: %w", err)
 	}
@@ -99,6 +130,10 @@ func (c *Consumer) Run(ctx context.Context) error {
 		return fmt.Errorf("replay: consume: %w", err)
 	}
 
+	// Per-connection dedupe: within one stream AMQP is at-least-once, so the
+	// same transfer id can be redelivered. No size cap — the bound is
+	// inherited from claim volume, and a wholesale reset would re-apply old
+	// redeliveries (a stale replay can regress a newer paint).
 	seen := make(map[string]struct{})
 	for {
 		select {
@@ -108,25 +143,29 @@ func (c *Consumer) Run(ctx context.Context) error {
 			if !ok {
 				return fmt.Errorf("replay: delivery channel closed")
 			}
-			ev, err := ParseMessage(d.Body)
-			if err != nil {
-				c.log.Warn("replay: bad message (acked to avoid poison-pill loop)", "err", err)
-				_ = d.Ack(false)
-				continue
-			}
-			key := ev.TransferID.String()
-			if key != "" {
-				if _, dup := seen[key]; dup {
-					_ = d.Ack(false)
-					continue
-				}
-				if len(seen) > 1_000_000 {
-					seen = make(map[string]struct{})
-				}
-				seen[key] = struct{}{}
-			}
-			c.sink.ApplyEvent(ev)
+			c.processBody(d.Body, seen)
+			// Ack after processing (bad messages and duplicates included): an
+			// unacked poison-pill message would otherwise redeliver forever.
 			_ = d.Ack(false)
 		}
 	}
+}
+
+// processBody parses, dedupes and applies one CDC message body. Parse
+// failures are logged and skipped (the caller's unconditional ack clears
+// them). Kept as a separate method so it can be tested without a broker.
+func (c *Consumer) processBody(body []byte, seen map[string]struct{}) {
+	ev, err := ParseMessage(body)
+	if err != nil {
+		c.log.Warn("replay: bad message (acked to avoid poison-pill loop)", "err", err)
+		return
+	}
+	key := ev.TransferID.String()
+	if key != "" {
+		if _, dup := seen[key]; dup {
+			return // redelivered; already applied
+		}
+		seen[key] = struct{}{}
+	}
+	c.sink.ApplyEvent(ev)
 }

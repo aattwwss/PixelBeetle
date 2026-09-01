@@ -137,6 +137,10 @@ func (tr *templateRenderer) renderHistory(w io.Writer, svc *game.Service) error 
 
 func decodeJSON[T any](w http.ResponseWriter, r *http.Request, out *T) bool {
 	defer func() { _, _ = io.Copy(io.Discard, r.Body) }()
+	// Cap the body: claim/confirm/admin payloads are a few hundred bytes, so
+	// 64KiB blocks trivial memory-exhaustion via a giant JSON document. The
+	// read side then fails with a "request body too large" error.
+	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
 	if err := json.NewDecoder(r.Body).Decode(out); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return false

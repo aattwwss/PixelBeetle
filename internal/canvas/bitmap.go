@@ -6,10 +6,11 @@ import (
 )
 
 // Bitmap is a packed color bitmap: one byte per cell, row-major (y outer,
-// x inner). Byte value 0 = empty; 1..15 = palette index (maps onto Palette in
-// canvas.go). This is the in-memory + transport representation of the canvas,
-// replacing per-cell DOM divs. A 1000x1000 canvas is 1MB raw and base64's to
-// ~1.33MB, but compresses to a few KB when sparse (gzip/zstd).
+// x inner). Byte value 0 = empty; 1..16 = palette index + 1 (matching the
+// game server's canvas encoding). This is the in-memory + transport
+// representation of the canvas, replacing per-cell DOM divs. A 1000x1000
+// canvas is 1MB raw and base64's to ~1.33MB, but compresses to a few KB when
+// sparse (gzip/zstd).
 type Bitmap struct {
 	Data []byte
 	W, H uint32

@@ -163,6 +163,13 @@ func (s *Server) handleHistoryFrame(w http.ResponseWriter, r *http.Request) {
 	}
 	bmp, effTs, err := s.svc.FrameAt(ts)
 	if err != nil {
+		if errors.Is(err, game.ErrFrameTooBroad) {
+			// The seek needs more than maxFramePages TB round-trips (no
+			// checkpoint near the point, or an unusually dense era): tell the
+			// client to pick a newer time instead of hammering the cluster.
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 		s.log.Error("history frame", "err", err, "tsMs", ts)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -204,6 +211,8 @@ func (s *Server) handleClaim(w http.ResponseWriter, r *http.Request, player uuid
 	}
 	id, err := s.svc.Claim(player, req.X, req.Y, req.Color)
 	switch {
+	case errors.Is(err, game.ErrOutOfBounds):
+		http.Error(w, err.Error(), http.StatusBadRequest)
 	case errors.Is(err, game.ErrLockedByOther):
 		http.Error(w, err.Error(), http.StatusConflict)
 	case err != nil:
@@ -276,8 +285,9 @@ func (s *Server) failClaim(w http.ResponseWriter, err error) {
 // ---- admin (bot load-generator heartbeat feeding the live metrics dashboard) ----
 
 // handleAdminBots absorbs the load generator's periodic heartbeat. It validates
-// nothing beyond JSON shape (demo telemetry); the merged snapshot is pushed to
-// browsers over the SSE hub.
+// nothing beyond JSON shape and is unauthenticated — the merged snapshot is
+// pushed to browsers over the SSE hub. Fine for a localhost demo; gate behind a
+// shared token before exposing the dashboard in any real deployment.
 func (s *Server) handleAdminBots(w http.ResponseWriter, r *http.Request) {
 	var rep botReport
 	if !decodeJSON(w, r, &rep) {

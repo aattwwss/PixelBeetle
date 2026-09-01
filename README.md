@@ -65,8 +65,8 @@ internal/tbclient  TigerBeetle wrapper + claim construction (shared by server & 
 internal/game      pixel cache, lock table, claim service
 internal/hub       DataStar SSE broadcast hub
 internal/web       SSR handlers + templates
-internal/replay    CDC consumer (AMQP parsing + dedupe)
-internal/warm      boot-time cache rebuild from query_transfers
+internal/replay    CDC consumer (AMQP parsing + dedupe, self-reconnecting)
+internal/canvas    packed bitmap encoding
 scripts/           tigerbeetle, server, cdc, rabbitmq
 web/static         static assets (incl. vendored datastar.js)
 ```

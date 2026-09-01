@@ -25,10 +25,11 @@ const (
 	TransferCodeClaim  uint16 = 1000 // base code; color ADDED by NewClaim (never OR: 1000 has bit 3 set, so OR aliases colors 8-15 onto 0-7)
 	TransferCodeRefund uint16 = 1001 // re-fund leg after a posted claim
 	// MaxColor is the inclusive upper bound of palette indices (16 colors).
-	// Enforced at the API so claim codes stay within 1000..1015 and can never
-	// wander into other code ranges. Code 1001 (claim color 1) is also
-	// TransferCodeRefund; the two are disambiguated by transfer flags —
-	// posted-claim legs always carry the post_pending_transfer bit.
+	// Claim codes stay within 1000..1015 and can never wander into other code
+	// ranges because NewClaim clamps color at the choke point where claims are
+	// minted. Code 1001 (claim color 1) is also TransferCodeRefund; the two
+	// are disambiguated by transfer flags — posted-claim legs always carry
+	// the post_pending_transfer bit.
 	MaxColor uint8 = 15
 
 	ClaimTimeoutSeconds uint32 = 3 // pending-lock window
@@ -159,14 +160,7 @@ func (c *Client) EnsureAllPixels(w, h uint32) error {
 	transfers := make([]tb.Transfer, 0, batchSize)
 	for i := 0; i < n; i++ {
 		x, y := uint32(i)%w, uint32(i)/w
-		transfers = append(transfers, tb.Transfer{
-			ID:              FundID(x, y),
-			DebitAccountID:  SystemPoolID,
-			CreditAccountID: PixelID(x, y),
-			Amount:          tb.ToUint128(1),
-			Code:            TransferCodeRefund,
-			Ledger:          LedgerCanvas,
-		})
+		transfers = append(transfers, fundTransfer(x, y))
 		if len(transfers) == batchSize {
 			if err := c.submitFundBatch(transfers); err != nil {
 				return err
@@ -232,9 +226,16 @@ func (c *Client) Fund(x, y uint32) error {
 //	code          = the color
 //	user_data_128 = the player id
 func NewClaim(x, y uint32, color uint8, player uuid.UUID) tb.Transfer {
+	// Clamp rather than fail: callers are expected to validate the palette
+	// (0..MaxColor), but clamping at this single choke point guarantees claim
+	// codes stay within TransferCodeClaim..TransferCodeClaim+MaxColor no
+	// matter who calls.
+	if color > MaxColor {
+		color = MaxColor
+	}
 	flags := tb.TransferFlags{Pending: true}
 	return tb.Transfer{
-		ID:              UUIDToUint128(uuid.Must(uuid.NewV7())),
+		ID:              tb.BytesToUint128(uuid.Must(uuid.NewV7())),
 		DebitAccountID:  PixelID(x, y),
 		CreditAccountID: SystemPoolID,
 		Amount:          tb.ToUint128(1),
@@ -246,12 +247,30 @@ func NewClaim(x, y uint32, color uint8, player uuid.UUID) tb.Transfer {
 	}
 }
 
+// IsPostedClaim extracts (x, y, color) from a posted claim leg. ok is false
+// when the transfer isn't a posted claim for an in-bounds pixel. A posted
+// claim leg carries the post_pending_transfer flag; its debit account is the
+// pixel and its code is TransferCodeClaim | color.
+func IsPostedClaim(t tb.Transfer, gridW, gridH uint32) (x, y uint32, color uint8, ok bool) {
+	if t.Flags&(tb.TransferFlags{PostPendingTransfer: true}.ToUint16()) == 0 {
+		return 0, 0, 0, false
+	}
+	x, y, ok = UnpackPixelID(t.DebitAccountID)
+	if !ok || x >= gridW || y >= gridH {
+		return 0, 0, 0, false
+	}
+	if t.Code < TransferCodeClaim {
+		return 0, 0, 0, false
+	}
+	return x, y, uint8(t.Code - TransferCodeClaim), true
+}
+
 // BuildPost builds the post leg of a confirm. Resolution legs may omit
 // debit/credit/ledger/code entirely (zero) — TB copies them from the pending.
 func BuildPost(claimID tb.Uint128) tb.Transfer {
 	flags := tb.TransferFlags{PostPendingTransfer: true}
 	return tb.Transfer{
-		ID:        UUIDToUint128(uuid.Must(uuid.NewV7())),
+		ID:        tb.BytesToUint128(uuid.Must(uuid.NewV7())),
 		PendingID: claimID,
 		Flags:     flags.ToUint16(),
 	}
@@ -261,7 +280,7 @@ func BuildPost(claimID tb.Uint128) tb.Transfer {
 func BuildVoid(claimID tb.Uint128) tb.Transfer {
 	flags := tb.TransferFlags{VoidPendingTransfer: true}
 	return tb.Transfer{
-		ID:        UUIDToUint128(uuid.Must(uuid.NewV7())),
+		ID:        tb.BytesToUint128(uuid.Must(uuid.NewV7())),
 		PendingID: claimID,
 		Flags:     flags.ToUint16(),
 	}
@@ -274,7 +293,7 @@ func BuildConfirm(claimID tb.Uint128, x, y uint32) []tb.Transfer {
 	post := BuildPost(claimID)
 	post.Flags = tb.TransferFlags{PostPendingTransfer: true, Linked: true}.ToUint16()
 	refund := tb.Transfer{ // plain posted transfer: put the unit back
-		ID:              UUIDToUint128(uuid.Must(uuid.NewV7())),
+		ID:              tb.BytesToUint128(uuid.Must(uuid.NewV7())),
 		DebitAccountID:  SystemPoolID,
 		CreditAccountID: PixelID(x, y),
 		Amount:          tb.ToUint128(1),
@@ -311,10 +330,6 @@ func (c *Client) SubmitBatch(transfers []tb.Transfer) error {
 		}
 	}
 	return nil
-}
-
-func UUIDToUint128(id uuid.UUID) tb.Uint128 {
-	return tb.BytesToUint128(id)
 }
 
 func Uint128ToUUID(v tb.Uint128) uuid.UUID {

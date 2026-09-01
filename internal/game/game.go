@@ -5,14 +5,11 @@ package game
 
 import (
 	"encoding/base64"
-	"encoding/binary"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -21,12 +18,12 @@ import (
 	"pixelbeetle/internal/hub"
 	"pixelbeetle/internal/replay"
 	"pixelbeetle/internal/tbclient"
-	"pixelbeetle/internal/warm"
 )
 
 var (
 	ErrLockedByOther = errors.New("pixel locked by another player")
 	ErrUnknownClaim  = errors.New("unknown claim")
+	ErrOutOfBounds   = errors.New("pixel coordinates out of bounds")
 )
 
 // Pixel is the derived canvas state served to clients.
@@ -41,18 +38,16 @@ type lock struct {
 }
 
 type ClaimMeta struct {
-	X, Y     uint32
-	Color    uint8
-	Player   uuid.UUID
-	Transfer [16]byte
+	X, Y   uint32
+	Color  uint8
+	Player uuid.UUID
 }
 
 type Service struct {
 	mu             sync.Mutex
 	gridW          uint32
 	gridH          uint32
-	pixels         map[uint64]Pixel // key = pack(x,y)
-	bmp            []byte           // standing canvas bitmap, row-major, 0=empty / 1..16 = color+1
+	bmp            []byte // standing canvas bitmap, row-major, 0=empty / 1..16 = color+1
 	locks          map[uint64]lock
 	claims         map[[16]byte]ClaimMeta   // claim transfer id -> meta, until resolved
 	byPlayer       map[uuid.UUID][16]byte   // player -> their single active claim
@@ -65,7 +60,7 @@ type Service struct {
 	anchorFile     *os.File                 // sidecar append handle (lazy, O_APPEND)
 	anchorBlobs    map[uint64]anchorBlobLoc // hash -> blob location in the sidecar (written or scanned)
 	lastAnchorHash uint64                   // hash of the immediately preceding record (consecutive stamp)
-	warmTs         uint64                   // watermark: last transfer ts folded by WarmCache (ns); CDC events at/below it are history replays
+	warmTs         uint64                   // watermark: newest folded state ts (ns); CDC events at/below it are redeliveries; snapshot ticker uses it as a dirty signal
 	warmed         bool                     // true once WarmCache completed; only a fully-warmed process may write snapshots
 	snapshot       string                   // on-disk snapshot path ("" = full replay every boot)
 	hub            *hub.Hub
@@ -75,17 +70,16 @@ type Service struct {
 	metrics        metrics
 }
 
-func New(w, h uint32, tb *tbclient.Client, h2 *hub.Hub, log *slog.Logger) *Service {
+func New(w, h uint32, tb *tbclient.Client, hub *hub.Hub, log *slog.Logger) *Service {
 	return &Service{
 		gridW:    w,
 		gridH:    h,
-		pixels:   make(map[uint64]Pixel),
 		bmp:      make([]byte, int(w)*int(h)),
 		locks:    make(map[uint64]lock),
 		claims:   make(map[[16]byte]ClaimMeta),
 		byPlayer: make(map[uuid.UUID][16]byte),
 		created:  make(map[uint64]struct{}),
-		hub:      h2,
+		hub:      hub,
 		tb:       tb,
 		log:      log,
 	}
@@ -98,6 +92,9 @@ func pack(x, y uint32) uint64 { return uint64(x)<<32 | uint64(y) }
 // A player holds at most ONE active claim: claiming again voids the previous
 // pending transfer first (server-enforced invariant, clients can't forget).
 func (s *Service) Claim(player uuid.UUID, x, y uint32, color uint8) ([16]byte, error) {
+	if x >= s.gridW || y >= s.gridH {
+		return [16]byte{}, ErrOutOfBounds
+	}
 	s.ensureSystemPool()
 	s.ensurePixel(x, y)
 
@@ -107,20 +104,26 @@ func (s *Service) Claim(player uuid.UUID, x, y uint32, color uint8) ([16]byte, e
 		s.mu.Unlock()
 		return [16]byte{}, ErrLockedByOther
 	}
-	// Supersede any prior claim held by this player.
+	// Supersede any prior claim held by this player. The old claim's lock is
+	// remembered so a failed submit below can restore it exactly.
 	var old ClaimMeta
+	oldID := [16]byte{}
 	hadOld := false
-	if oldID, ok := s.byPlayer[player]; ok {
-		if m, ok := s.claims[oldID]; ok {
-			old = m
-			hadOld = true
-			s.vacate(oldID, pack(old.X, old.Y))
+	hadLock := false
+	var oldLock lock
+	if id, ok := s.byPlayer[player]; ok {
+		if m, ok := s.claims[id]; ok {
+			oldID, old, hadOld = id, m, true
+			if l, ok := s.locks[pack(m.X, m.Y)]; ok {
+				oldLock, hadLock = l, true
+			}
+			s.vacate(id, pack(m.X, m.Y))
 		}
 	}
 	t := tbclient.NewClaim(x, y, color, player)
 	id := t.ID.Bytes()
 	s.locks[key] = lock{player: player, expires: time.Now().Add(time.Duration(tbclient.ClaimTimeoutSeconds) * time.Second)}
-	s.claims[id] = ClaimMeta{X: x, Y: y, Color: color, Player: player, Transfer: t.ID.Bytes()}
+	s.claims[id] = ClaimMeta{X: x, Y: y, Color: color, Player: player}
 	s.byPlayer[player] = id
 	s.mu.Unlock()
 
@@ -131,7 +134,18 @@ func (s *Service) Claim(player uuid.UUID, x, y uint32, color uint8) ([16]byte, e
 		s.mu.Lock()
 		delete(s.locks, key)
 		delete(s.claims, id)
-		delete(s.byPlayer, player)
+		if hadOld {
+			// The superseded claim was vacated above; restore it so the player
+			// keeps their previous (still-durable) pending claim instead of
+			// having it silently destroyed by a failed submit.
+			s.claims[oldID] = old
+			s.byPlayer[player] = oldID
+			if hadLock {
+				s.locks[pack(old.X, old.Y)] = oldLock
+			}
+		} else {
+			delete(s.byPlayer, player)
+		}
 		s.mu.Unlock()
 		if errors.Is(err, tbclient.ErrPixelLocked) {
 			s.metrics.conflicts.Add(1)
@@ -145,7 +159,7 @@ func (s *Service) Claim(player uuid.UUID, x, y uint32, color uint8) ([16]byte, e
 	// Void the superseded pending transfer. If this fails the transfer still
 	// self-expires in TB after its timeout; the UI is already consistent.
 	if hadOld {
-		if err := s.tb.Submit(tbclient.BuildVoid(u128(old.Transfer))); err != nil {
+		if err := s.tb.Submit(tbclient.BuildVoid(tb.BytesToUint128(oldID))); err != nil {
 			if errors.Is(err, tbclient.ErrClaimExpired) {
 				// TB already voided the expired pending and freed the old cell —
 				// broadcast the unlock so clients clear the stale yellow box (the
@@ -185,7 +199,7 @@ func (s *Service) Confirm(player uuid.UUID, claimID [16]byte) error {
 	if err != nil {
 		return err
 	}
-	confirm := tbclient.BuildConfirm(u128(meta.Transfer), meta.X, meta.Y)
+	confirm := tbclient.BuildConfirm(tb.BytesToUint128(claimID), meta.X, meta.Y)
 	if err := s.tb.SubmitBatch(confirm); err != nil {
 		if errors.Is(err, tbclient.ErrClaimExpired) {
 			// The pending timed out in TB before this confirm landed — TB already
@@ -200,13 +214,27 @@ func (s *Service) Confirm(player uuid.UUID, claimID [16]byte) error {
 
 	// Anchor checkpoints must see the canvas BEFORE this paint lands, so a
 	// minute-boundary bitmap never contains the paint that crossed it.
+	// The wall clock is the boundary basis (SubmitBatch doesn't return the
+	// post leg's TB timestamp). Skew vs. TB's clock is safe in both
+	// directions: an anchor stamped before a paint's TB ts makes the fold
+	// re-apply that paint (idempotent, same color); an anchor stamped after
+	// it already contains the paint in its bitmap, so the fold simply
+	// doesn't need to re-apply. Worst case is a few-ms "paint appears a
+	// frame early/late" at one boundary — invisible at 1-minute granularity.
 	nowNs := time.Now().UnixNano()
 	s.mu.Lock()
 	s.ag.syncTo(nowNs, s.bmp)
 	key := pack(meta.X, meta.Y)
-	s.pixels[key] = Pixel{Color: meta.Color}
 	s.bmp[int(meta.Y)*int(s.gridW)+int(meta.X)] = meta.Color%16 + 1
 	s.notePaint(nowNs / 1_000_000)
+	// Advance the watermark so the snapshot ticker's dirty-check fires.
+	// SubmitBatch doesn't return the post leg's TB timestamp, so the server
+	// wall clock is the proxy; on a single-host demo TB's clock tracks ours,
+	// and ApplyEvent below only drops CDC redeliveries of events the cache
+	// already applied anyway.
+	if nowNs > int64(s.warmTs) {
+		s.warmTs = uint64(nowNs)
+	}
 	s.vacate(claimID, key)
 	s.mu.Unlock()
 
@@ -223,7 +251,7 @@ func (s *Service) Cancel(player uuid.UUID, claimID [16]byte) error {
 	if err != nil {
 		return err
 	}
-	void := tbclient.BuildVoid(u128(meta.Transfer))
+	void := tbclient.BuildVoid(tb.BytesToUint128(claimID))
 	if err := s.tb.Submit(void); err != nil {
 		return err
 	}
@@ -235,7 +263,8 @@ func (s *Service) Cancel(player uuid.UUID, claimID [16]byte) error {
 	return nil
 }
 
-// resolve validates ownership and removes the claim from the registry.
+// resolve validates ownership and returns the claim. Callers remove the
+// claim from the registry afterwards via vacate.
 func (s *Service) resolve(player uuid.UUID, claimID [16]byte) (ClaimMeta, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -246,15 +275,30 @@ func (s *Service) resolve(player uuid.UUID, claimID [16]byte) (ClaimMeta, error)
 	return m, nil
 }
 
-// Snapshot returns current derived pixels for SSR rendering / SSE resync.
+// Snapshot returns the currently painted pixels for SSR rendering / SSE
+// resync. Derived from the standing bitmap — the single source of truth (the
+// old pixels map duplicated it and had to be kept in lockstep).
 func (s *Service) Snapshot() map[uint64]Pixel {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := make(map[uint64]Pixel, len(s.pixels))
-	for k, v := range s.pixels {
-		out[k] = v
+	out := make(map[uint64]Pixel, s.paintedCount())
+	for i, v := range s.bmp {
+		if v > 0 {
+			out[pack(uint32(i%int(s.gridW)), uint32(i/int(s.gridW)))] = Pixel{Color: v - 1}
+		}
 	}
 	return out
+}
+
+// paintedCount returns how many cells are painted. Caller must hold s.mu.
+func (s *Service) paintedCount() int {
+	n := 0
+	for _, v := range s.bmp {
+		if v > 0 {
+			n++
+		}
+	}
+	return n
 }
 
 // SnapshotBmp returns the full canvas as a base64 packed bitmap (one byte per
@@ -345,330 +389,18 @@ func (s *Service) FrameAt(tsMs int64) (string, int64, error) {
 	s.mu.Unlock()
 
 	toNs := uint64(tsMs)*1_000_000 + 999_999
-	const limit = 4000
-	for from := fromNs; ; {
-		page, err := s.tb.QueryCanvasTransfers(from, limit)
-		if err != nil {
-			return "", 0, err
+	if _, err := s.foldFrom(fromNs, maxFramePages, func(t tb.Transfer) bool {
+		if t.Timestamp > toNs {
+			return true // stop: past the frame's window
 		}
-		stop := false
-		for _, t := range page {
-			if t.Timestamp > toNs {
-				stop = true
-				break
-			}
-			if x, y, color, ok := warm.PostedClaim(t, s.gridW, s.gridH); ok {
-				start[int(y)*int(s.gridW)+int(x)] = byte(color%16 + 1)
-			}
+		if x, y, color, ok := tbclient.IsPostedClaim(t, s.gridW, s.gridH); ok {
+			start[int(y)*int(s.gridW)+int(x)] = byte(color%16 + 1)
 		}
-		if stop || len(page) < limit {
-			break
-		}
-		from = page[len(page)-1].Timestamp + 1
+		return false
+	}); err != nil {
+		return "", 0, err
 	}
 	return base64.StdEncoding.EncodeToString(start), tsMs, nil
-}
-
-// SetSnapshot configures the on-disk materialized-state snapshot for O(delta)
-// restarts. Call before WarmCache; the server ticker should periodically call
-// SaveSnapshot so the file tracks the live state. A sidecar file next to the
-// snapshot (<path>.anchors) holds checkpoint bitmaps evicted from RAM so
-// old timeline seeks start from a real state instead of the empty canvas.
-func (s *Service) SetSnapshot(path string) {
-	s.snapshot = path
-	s.anchorPath = path + ".anchors"
-	s.ag.onEvict = func(tsMs int64, hash uint64, bmp []byte) (int64, uint32, error) {
-		return s.writeAnchorBlob(tsMs, hash, bmp)
-	}
-}
-
-// anchorRecHeader is one sidecar record's fixed prefix: {tsMs i64, hash u64,
-// len u32}, optionally followed by len bitmap bytes. A record with len==0
-// means "identical state to the previous record" (idle-minute chains
-// collapse to 20 bytes). Records are ascending by tsMs by construction.
-const anchorRecHeader = 20
-
-// anchorBlobLoc locates a checkpoint bitmap inside the sidecar file.
-type anchorBlobLoc struct {
-	Off int64
-	Len uint32
-}
-
-// writeAnchorBlob appends one evicted checkpoint to the sidecar file and
-// returns the blob's offset/length. Every eviction writes a record (so the
-// rebooted index keeps each boundary's timestamp); identical states share
-// the same blob via a len==0 reuse record, and consecutive identical states
-// are 20-byte stamps. Runs under s.mu (runtime eviction sites hold it) and
-// during the warmup fold (single-threaded, lock-free). Torn appends (crash
-// mid-write) are healed by scanAnchorSidecar at next boot.
-func (s *Service) writeAnchorBlob(tsMs int64, hash uint64, bmp []byte) (int64, uint32, error) {
-	if s.anchorPath == "" {
-		return 0, 0, fmt.Errorf("history: anchor sidecar not configured")
-	}
-	if s.anchorFile == nil {
-		f, err := os.OpenFile(s.anchorPath, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o644)
-		if err != nil {
-			return 0, 0, err
-		}
-		// Single-writer guard: two servers appending to the same sidecar
-		// interleave records and corrupt the index (tsMs inversions). Fail
-		// fast instead.
-		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-			f.Close()
-			return 0, 0, fmt.Errorf("history: anchor sidecar is locked by another process: %w", err)
-		}
-		s.anchorFile = f
-	}
-	if s.anchorBlobs == nil {
-		s.anchorBlobs = make(map[uint64]anchorBlobLoc)
-	}
-	end, err := s.anchorFile.Seek(0, io.SeekEnd)
-	if err != nil {
-		return 0, 0, err
-	}
-
-	sameAsLast := hash == s.lastAnchorHash
-	loc, known := s.anchorBlobs[hash]
-	rec := make([]byte, 0, anchorRecHeader+len(bmp))
-	rec = binary.LittleEndian.AppendUint64(rec, uint64(tsMs))
-	rec = binary.LittleEndian.AppendUint64(rec, hash)
-	switch {
-	case sameAsLast || known:
-		// Reuse the existing blob: consecutive identical state, or a state
-		// already written earlier in the file. 20 bytes, no bitmap payload.
-		rec = binary.LittleEndian.AppendUint32(rec, 0)
-	default:
-		// New state: full record {header, bitmap}; blob starts after the header.
-		rec = binary.LittleEndian.AppendUint32(rec, uint32(len(bmp)))
-		rec = append(rec, bmp...)
-		loc = anchorBlobLoc{Off: end + anchorRecHeader, Len: uint32(len(bmp))}
-		s.anchorBlobs[hash] = loc
-	}
-	if _, err := s.anchorFile.Write(rec); err != nil {
-		return 0, 0, err
-	}
-	s.lastAnchorHash = hash
-	return loc.Off, loc.Len, nil
-}
-
-// readAnchorBlob fetches one evicted checkpoint's bytes from the sidecar by
-// reference, validating the stored hash. Locking variant for callers that
-// don't already hold s.mu.
-func (s *Service) readAnchorBlob(ref anchorRef) ([]byte, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.readAnchorBlobLocked(ref)
-}
-
-// readAnchorBlobLocked is readAnchorBlob without locking — FrameAt calls it
-// while holding s.mu. The flock on the handle still guards cross-process
-// access.
-func (s *Service) readAnchorBlobLocked(ref anchorRef) ([]byte, error) {
-	if s.anchorFile == nil && s.anchorPath != "" {
-		f2, err := os.OpenFile(s.anchorPath, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o644)
-		if err != nil {
-			return nil, err
-		}
-		if err := syscall.Flock(int(f2.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-			f2.Close()
-			return nil, fmt.Errorf("history: anchor sidecar is locked by another process: %w", err)
-		}
-		s.anchorFile = f2
-	}
-	f := s.anchorFile
-	if f == nil {
-		return nil, fmt.Errorf("history: anchor sidecar not configured")
-	}
-	if ref.Len == 0 || ref.Len > uint32(maxAnchorPoolSize) {
-		return nil, fmt.Errorf("history: sidecar blob length %d implausible", ref.Len)
-	}
-	bmp := make([]byte, ref.Len)
-	if _, err := f.ReadAt(bmp, ref.Off); err != nil {
-		return nil, err
-	}
-	if h := bmpHash(bmp); h != ref.Hash {
-		return nil, fmt.Errorf("history: sidecar blob hash mismatch (torn write?)")
-	}
-	return bmp, nil
-}
-
-// scanAnchorSidecar rebuilds the evicted-checkpoint index by walking the
-// sidecar file (used at boot; the index is not persisted — the file is
-// self-describing). Reuse records (len==0) resolve their blob via the hash
-// registered by an earlier full record. Stops at the first torn/short
-// record.
-func (s *Service) scanAnchorSidecar() error {
-	if s.anchorPath == "" {
-		return nil
-	}
-	data, err := os.ReadFile(s.anchorPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
-	}
-
-	var entries []anchorRef
-	blobs := make(map[uint64]anchorBlobLoc)
-	for pos := 0; pos+anchorRecHeader <= len(data); {
-		tsMs := int64(binary.LittleEndian.Uint64(data[pos : pos+8]))
-		h := binary.LittleEndian.Uint64(data[pos+8 : pos+16])
-		ln := binary.LittleEndian.Uint32(data[pos+16 : pos+20])
-		pos += anchorRecHeader
-		var loc anchorBlobLoc
-		if ln == 0 {
-			// Reuse record: point at the blob this hash registered earlier.
-			var ok bool
-			loc, ok = blobs[h]
-			if !ok {
-				break // reuse before any full record: corrupt file
-			}
-		} else {
-			if ln > uint32(maxAnchorPoolSize) || pos+int(ln) > len(data) {
-				break // torn tail
-			}
-			loc = anchorBlobLoc{Off: int64(pos), Len: ln}
-			blobs[h] = loc
-			pos += int(ln)
-		}
-		entries = append(entries, anchorRef{TsMs: tsMs, Off: loc.Off, Len: loc.Len, Hash: h})
-	}
-
-	s.mu.Lock()
-	s.ag.evicted = entries
-	s.anchorBlobs = blobs
-	s.mu.Unlock()
-	s.log.Info("anchor sidecar scanned", "entries", len(entries), "blobs", len(blobs), "bytes", len(data))
-	return nil
-}
-
-// resetAnchorSidecar truncates the sidecar for a full-replay warmup (which
-// regenerates the entire evicted timeline from the ledger).
-func (s *Service) resetAnchorSidecar() error {
-	if s.anchorPath == "" {
-		return nil
-	}
-	if s.anchorFile != nil {
-		s.anchorFile.Close()
-		s.anchorFile = nil
-	}
-	f, err := os.OpenFile(s.anchorPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
-	if err != nil {
-		return err
-	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		f.Close()
-		return fmt.Errorf("history: anchor sidecar is locked by another process: %w", err)
-	}
-	s.anchorFile = f
-	s.lastAnchorHash = 0
-	s.anchorBlobs = make(map[uint64]anchorBlobLoc)
-	return nil
-}
-
-// WarmTs returns the current CDC watermark (the newest ledger timestamp
-// folded). The snapshot ticker uses it as a cheap dirty-check.
-func (s *Service) WarmTs() uint64 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.warmTs
-}
-
-// WarmCache rebuilds the pixel cache from TigerBeetle transfer history so a
-// restarted server shows the canvas instead of a blank grid.
-func (s *Service) WarmCache() error {
-	// Fast path: load the on-disk snapshot, then fold only the delta since it.
-	if s.snapshot != "" {
-		if used, err := s.warmFromSnapshot(s.snapshot); err == nil {
-			_ = used
-			if err := s.scanAnchorSidecar(); err != nil {
-				s.log.Warn("anchor sidecar scan failed; old timeline seeks will fold from zero", "err", err)
-			}
-			return nil
-		} else {
-			s.log.Warn("snapshot unusable, falling back to full replay", "err", err)
-		}
-	}
-	// Full replay regenerates the whole timeline, including evicted-checkpoint
-	// sidecar entries — start that file fresh.
-	if err := s.resetAnchorSidecar(); err != nil {
-		s.log.Warn("anchor sidecar reset failed; evicted checkpoints will be dropped", "err", err)
-	}
-	const limit = 4000
-	start := time.Now()
-	s.log.Info("warmup starting: replaying canvas history from TigerBeetle")
-	seen := make(map[uint64]Pixel)
-	foldBmp := make([]byte, int(s.gridW)*int(s.gridH))
-	var ag anchorGrid
-	ag.onEvict = s.ag.onEvict // persist evicted checkpoints during the fold
-	var firstPaint, lastPaint int64
-	var from uint64
-	var scanned uint64
-	var lastTs uint64 // max transfer timestamp folded (the CDC watermark)
-
-	// applyFold folds one ledger transfer into the local build state: advance
-	// the anchor grid (every transfer, so boundaries stay dense), then paint
-	// posted claims into the bitmap + pixel map + timeline bounds.
-	apply := func(t tb.Transfer) {
-		ag.syncTo(int64(t.Timestamp), foldBmp)
-		x, y, color, ok := warm.PostedClaim(t, s.gridW, s.gridH)
-		if !ok {
-			return
-		}
-		key := pack(x, y)
-		seen[key] = Pixel{Color: color}
-		foldBmp[int(y)*int(s.gridW)+int(x)] = byte(color%16 + 1)
-		ms := int64(t.Timestamp / 1_000_000)
-		if firstPaint == 0 || ms < firstPaint {
-			firstPaint = ms
-		}
-		if ms > lastPaint {
-			lastPaint = ms
-		}
-	}
-
-	for pageIdx := 0; ; pageIdx++ {
-		page, err := s.tb.QueryCanvasTransfers(from, limit)
-		if err != nil {
-			return err
-		}
-		scanned += uint64(len(page))
-		if len(page) > 0 {
-			lastTs = page[len(page)-1].Timestamp
-		}
-		for _, t := range page {
-			apply(t)
-		}
-		// Progress every ~40k transfers (~10 pages of 4000), so a large
-		// ledger (bot runs push millions of transfers) shows the server is
-		// alive instead of looking hung.
-		if pageIdx > 0 && pageIdx%10 == 0 {
-			s.log.Info("warming up", "page", pageIdx, "scanned", scanned, "pixels", len(seen))
-		}
-		if len(page) < limit {
-			break
-		}
-		from = page[len(page)-1].Timestamp + 1
-	}
-	s.mu.Lock()
-	s.pixels = seen
-	s.bmp = foldBmp
-	s.ag = ag
-	s.firstPaintMs = firstPaint
-	s.lastPaintMs = lastPaint
-	// Watermark: everything at/below the newest folded transfer is history
-	// the CDC stream will re-deliver. ApplyEvent drops those so a backlog
-	// replay can't re-broadcast old paints.
-	s.warmTs = lastTs
-	s.warmed = true
-	// Fill the checkpoint grid up to now so quiet stretches after the last
-	// transfer are still dense with anchors (see anchorGrid.fillTo).
-	s.ag.fillTo(time.Now().UnixMilli(), foldBmp)
-	s.mu.Unlock()
-	s.log.Info("warmup complete", "scanned", scanned, "pixels", len(seen),
-		"anchors", len(s.ag.list), "anchorPool", len(s.ag.pool), "elapsed", time.Since(start).Round(time.Millisecond))
-	return nil
 }
 
 // ApplyEvent ingests a CDC event (replay.Sink). It only reacts to posted
@@ -679,24 +411,34 @@ func (s *Service) ApplyEvent(ev replay.Event) {
 	if ev.Type != replay.TypePosted {
 		return
 	}
-	s.mu.Lock()
-	stale := ev.Timestamp <= s.warmTs
-	s.mu.Unlock()
-	if stale {
-		return // already folded into the cache by WarmCache
+	if ev.X >= s.gridW || ev.Y >= s.gridH {
+		s.log.Warn("CDC event outside the grid", "x", ev.X, "y", ev.Y)
+		return
 	}
-	key := pack(ev.X, ev.Y)
 	s.mu.Lock()
-	// Advance the checkpoint grid before mutating the bitmap, for the same
-	// reason as in Confirm: a boundary bitmap must not contain its trigger.
-	s.ag.syncTo(int64(ev.Timestamp), s.bmp)
-	cur, ok := s.pixels[key]
-	if ok && cur.Color == ev.Color {
+	if ev.Timestamp <= s.warmTs {
+		// Already folded into the cache by warm-up: a redelivery, not a new
+		// paint. (Order-sensitivity: a stale redelivery with a different color
+		// could regress a newer paint — correctness leans on the replay sink's
+		// transfer-id dedupe.)
 		s.mu.Unlock()
 		return
 	}
-	s.pixels[key] = Pixel{Color: ev.Color}
-	s.bmp[int(ev.Y)*int(s.gridW)+int(ev.X)] = ev.Color%16 + 1
+	// Advance the checkpoint grid before mutating the bitmap, for the same
+	// reason as in Confirm: a boundary bitmap must not contain its trigger.
+	s.ag.syncTo(int64(ev.Timestamp), s.bmp)
+	idx := int(ev.Y)*int(s.gridW) + int(ev.X)
+	if s.bmp[idx] == ev.Color%16+1 {
+		s.mu.Unlock()
+		return // idempotent no-op on the instance that already painted it
+	}
+	s.bmp[idx] = ev.Color%16 + 1
+	// The watermark doubles as the snapshot-ticker dirty signal: an applied
+	// event must bump it so the periodic save actually fires (TB timestamps
+	// are monotonic, so max() is a move-forward, never a regress).
+	if ev.Timestamp > s.warmTs {
+		s.warmTs = ev.Timestamp
+	}
 	s.notePaint(int64(ev.Timestamp / 1_000_000))
 	s.mu.Unlock()
 	s.hub.BroadcastPaint(ev.X, ev.Y, ev.Color)
@@ -763,6 +505,13 @@ func (s *Service) ensureSystemPool() {
 // (exists == ok). Accounts are normally provisioned in bulk at boot via
 // InitAllPixels; this first-touch path covers cells claimed before that
 // finishes or when -eager is off, so a claim never races account creation.
+//
+// Two concurrent first claims may both pass the created-check before either
+// sets s.created; that's benign — EnsureAccounts and Fund are idempotent
+// (Fund's deterministic FundID makes a double credit a TransferExists no-op),
+// so the pixel still ends up with exactly one claimable unit. Holding s.mu
+// across the TB calls was considered and rejected: waiting on network I/O
+// under the global lock would stall every claim.
 func (s *Service) ensurePixel(x, y uint32) {
 	s.mu.Lock()
 	all := s.allCreated
@@ -793,13 +542,13 @@ func (s *Service) TickMetrics() { s.metrics.tick() }
 func (s *Service) MetricsSnapshot() map[string]any {
 	s.mu.Lock()
 	locks := len(s.locks)
-	pixels := len(s.pixels)
+	pixels := s.paintedCount()
 	s.mu.Unlock()
 	return s.metrics.snapshot(locks, pixels)
 }
 
 func (s *Service) Describe() string {
-	return fmt.Sprintf("grid=%dx%d pixels=%d", s.gridW, s.gridH, len(s.Snapshot()))
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return fmt.Sprintf("grid=%dx%d pixels=%d", s.gridW, s.gridH, s.paintedCount())
 }
-
-func u128(b [16]byte) tb.Uint128 { return tb.BytesToUint128(b) }

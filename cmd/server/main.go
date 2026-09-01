@@ -3,11 +3,15 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"pixelbeetle/internal/game"
@@ -46,8 +50,14 @@ func main() {
 	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 
+	// Everything below — CDC, reaper, snapshot ticker, metrics, HTTP — belongs
+	// to one process lifetime. Ctrl-C / SIGTERM cancels it and each component
+	// drains instead of being killed mid-write.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	var gw, gh uint32
-	if _, err := fmtSscan(*grid, &gw, &gh); err != nil {
+	if _, err := fmt.Sscanf(*grid, "%dx%d", &gw, &gh); err != nil {
 		log.Error("invalid -grid, want WxH like 64x64", "got", *grid)
 		os.Exit(1)
 	}
@@ -83,12 +93,17 @@ func main() {
 	go func() { // unlock stale UI locks; TB auto-expires the transfers themselves
 		t := time.NewTicker(*reapPeriod)
 		defer t.Stop()
-		for range t.C {
-			svc.ReapExpired()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				svc.ReapExpired()
+			}
 		}
 	}()
 
-	if *cdcURL != "" { // live CDC subscriber keeps the cache in sync
+	if *cdcURL != "" { // live CDC subscriber keeps the cache in sync; reconnects internally
 		consumer := replay.NewConsumer(replay.Config{
 			AMQPURL:  *cdcURL,
 			Exchange: *cdcExchange,
@@ -96,7 +111,7 @@ func main() {
 		}, svc)
 		go func() {
 			log.Info("CDC consumer starting", "url", *cdcURL, "exchange", *cdcExchange)
-			if err := consumer.Run(context.Background()); err != nil && err != context.Canceled {
+			if err := consumer.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 				log.Error("CDC consumer stopped", "err", err)
 			}
 		}()
@@ -107,7 +122,7 @@ func main() {
 		log.Error("build web server", "err", err)
 		os.Exit(1)
 	}
-	webSrv.StartMetrics(context.Background()) // live dashboard over the SSE hub
+	webSrv.StartMetrics(ctx) // live dashboard over the SSE hub; stops on shutdown
 
 	if *snapshot != "" && *warmup && *snapEvery > 0 { // persist the derived state so the next boot is O(delta)
 		// Gated on -warmup: a server that skipped warmup holds partial state
@@ -115,8 +130,8 @@ func main() {
 		// enforces the same invariant defensively.
 		// Baseline: write once right after warmup so the boot-time replay work is
 		// persisted even if the process dies before the next tick. Then the ticker
-		// only rewrites when the watermark has advanced (any ledger activity),
-		// avoiding pointless rewrites of an unchanged file.
+		// only rewrites when the watermark has advanced (any ledger activity or
+		// server-originated confirm), avoiding pointless rewrites.
 		if err := svc.SaveSnapshot(*snapshot); err != nil {
 			log.Error("snapshot save (initial)", "err", err)
 		}
@@ -124,27 +139,51 @@ func main() {
 		go func() {
 			t := time.NewTicker(*snapEvery)
 			defer t.Stop()
-			for range t.C {
-				cur := svc.WarmTs()
-				if cur == last {
-					continue // nothing new to snapshot
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					cur := svc.WarmTs()
+					if cur == last {
+						continue // nothing new to snapshot
+					}
+					if err := svc.SaveSnapshot(*snapshot); err != nil {
+						log.Error("snapshot save", "err", err)
+					} else {
+						last = cur
+					}
 				}
-				if err := svc.SaveSnapshot(*snapshot); err != nil {
-					log.Error("snapshot save", "err", err)
-				}
-				last = cur
 			}
 		}()
 	}
 
-	log.Info("pixelbeetle starting", "addr", *addr, "desc", svc.Describe())
-	if err := http.ListenAndServe(*addr, webSrv.Routes()); err != nil {
-		log.Error("listen", "err", err)
-		os.Exit(1)
+	// No WriteTimeout: the SSE stream is long-lived and would be killed by a
+	// fixed write deadline. ReadHeader/Idle still bound idle connections.
+	httpSrv := &http.Server{
+		Addr:              *addr,
+		Handler:           webSrv.Routes(),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
-}
 
-// fmtSscan avoids importing fmt just for one call site.
-func fmtSscan(s string, a, b *uint32) (int, error) {
-	return sscan(s, a, b)
+	log.Info("pixelbeetle starting", "addr", *addr, "desc", svc.Describe())
+	srvErr := make(chan error, 1)
+	go func() { srvErr <- httpSrv.ListenAndServe() }()
+
+	select {
+	case <-ctx.Done(): // SIGINT/SIGTERM: drain and exit cleanly
+		log.Info("shutting down")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := httpSrv.Shutdown(shutdownCtx); err != nil {
+			log.Warn("graceful shutdown", "err", err)
+		}
+	case err := <-srvErr:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Error("listen", "err", err)
+			os.Exit(1)
+		}
+	}
 }

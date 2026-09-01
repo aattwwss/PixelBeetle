@@ -48,7 +48,7 @@ func main() {
 		Ramp:     *ramp,
 		Players:  *players,
 	}
-	if _, err := fmtSscanGrid(*grid, &cfg.GridW, &cfg.GridH); err != nil {
+	if _, err := fmt.Sscanf(*grid, "%dx%d", &cfg.GridW, &cfg.GridH); err != nil {
 		log.Error("invalid -grid, want WxH like 256x256", "got", *grid)
 		os.Exit(1)
 	}
@@ -58,7 +58,7 @@ func main() {
 	}
 	if *hotspot != "" {
 		var x, y uint32
-		if _, err := fmtSscan(*hotspot, &x, &y); err != nil {
+		if _, err := fmt.Sscanf(*hotspot, "%d:%d", &x, &y); err != nil {
 			log.Error("invalid -hotspot, want x:y", "got", *hotspot)
 			os.Exit(1)
 		}

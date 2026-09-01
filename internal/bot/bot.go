@@ -13,6 +13,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -36,6 +37,12 @@ const (
 	ModeAPI    Mode = "api"
 	ModeDirect Mode = "direct"
 )
+
+// errLocked is the single "pixel locked by another player" outcome in both
+// modes, so Metrics can classify conflicts with errors.Is instead of string
+// comparison. The game server returns it (as game.ErrLockedByOther) on 409;
+// direct mode maps tbclient.ErrPixelLocked to it at the adapter boundary.
+var errLocked = errors.New("pixel locked by another player")
 
 type Config struct {
 	Target   string        // game server base URL (api mode)
@@ -237,7 +244,7 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) (*Metrics, error) {
 				if rng.Float64() < cfg.Abandon {
 					// Walk away: TB auto-expires the pending transfer and CDC
 					// emits two_phase_expired. This is the expiry-path demo.
-					m.dropLatency(started)
+					// Abandoned claims are excluded from latency (see LatencyReport).
 					continue
 				}
 				if err := resolveClaim(ctx, agentClient, direct, cfg.Target, claimID, x, y, true); err != nil {
@@ -269,7 +276,7 @@ func (c Config) Mode() Mode {
 }
 
 func (m *Metrics) recordFailure(err error, counter *atomic.Uint64) {
-	if err.Error() == "pixel locked by another player" {
+	if errors.Is(err, errLocked) {
 		m.LockConflicts.Add(1)
 		return
 	}
@@ -282,8 +289,6 @@ func (m *Metrics) recordLatency(started time.Time) {
 	m.latencies = append(m.latencies, ms)
 	m.latMu.Unlock()
 }
-
-func (m *Metrics) dropLatency(started time.Time) {} // abandoned claims excluded from latency
 
 // LatencyReport returns p50/p99 in ms over recorded full claim cycles.
 func (m *Metrics) LatencyReport() (p50, p99 float64) {
@@ -307,6 +312,9 @@ func submitClaim(ctx context.Context, hc *http.Client, direct *tbclient.Client, 
 	if direct != nil { // direct mode: same claim builder, straight to TB
 		t := tbclient.NewClaim(x, y, color, player)
 		if err := direct.Submit(t); err != nil {
+			if errors.Is(err, tbclient.ErrPixelLocked) {
+				return "", errLocked
+			}
 			return "", err
 		}
 		id := t.ID.Bytes()
@@ -326,7 +334,7 @@ func submitClaim(ctx context.Context, hc *http.Client, direct *tbclient.Client, 
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode == http.StatusConflict {
-		return "", fmt.Errorf("pixel locked by another player")
+		return "", errLocked
 	}
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("claim: %d %s", resp.StatusCode, raw)
@@ -371,13 +379,4 @@ func resolveClaim(ctx context.Context, hc *http.Client, direct *tbclient.Client,
 		return fmt.Errorf("%s: %d %s", action, resp.StatusCode, raw)
 	}
 	return nil
-}
-
-func toTB(b [16]byte) tb.Uint128 { return tb.BytesToUint128(b) }
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }

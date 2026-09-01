@@ -4,106 +4,75 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/big"
+	"strconv"
 
 	tb "github.com/tigerbeetle/tigerbeetle-go"
 
 	"pixelbeetle/internal/tbclient"
 )
 
-// flexU128 accepts a TigerBeetle u128 encoded as either a decimal JSON string
-// (the documented form) or a bare JSON number (seen in doc examples). We
-// support both so consumers are robust to the CDC encoder's choice.
-type flexU128 struct {
+// cdcU128 decodes a TigerBeetle u128 from its decimal JSON string — the one
+// encoding the pinned `tigerbeetle amqp` CDC producer emits. A future
+// encoder change should surface here as a loud parse error (which the
+// consumer acks as a poison pill) rather than as silent tolerance of a
+// second format.
+type cdcU128 struct {
 	V tb.Uint128
 }
 
-func (f *flexU128) UnmarshalJSON(b []byte) error {
+func (f *cdcU128) UnmarshalJSON(b []byte) error {
 	if len(b) == 0 || string(b) == "null" {
 		f.V = tb.ToUint128(0)
 		return nil
 	}
-	var bi *big.Int
-	if b[0] == '"' {
-		var s string
-		if err := json.Unmarshal(b, &s); err != nil {
-			return err
-		}
-		var ok bool
-		bi, ok = new(big.Int).SetString(s, 10)
-		if !ok {
-			return fmt.Errorf("invalid u128 decimal string %q", s)
-		}
-	} else {
-		// Bare JSON numbers may exceed uint64; json.Number preserves them
-		// exactly as text so big.Int can parse arbitrary precision.
-		var n json.Number
-		if err := json.Unmarshal(b, &n); err != nil {
-			return fmt.Errorf("invalid u128 number %s: %w", string(b), err)
-		}
-		var ok bool
-		bi, ok = new(big.Int).SetString(n.String(), 10)
-		if !ok {
-			return fmt.Errorf("invalid u128 number %s", string(b))
-		}
+	var s string
+	if err := json.Unmarshal(b, &s); err != nil {
+		return fmt.Errorf("replay: u128 must be a decimal JSON string, got %s", b)
+	}
+	bi, ok := new(big.Int).SetString(s, 10)
+	if !ok {
+		return fmt.Errorf("replay: invalid u128 decimal string %q", s)
 	}
 	f.V = tb.BigIntToUint128(bi)
 	return nil
 }
 
-// flexU64 accepts a u64 encoded as either a decimal JSON string or a bare
-// JSON number.
-type flexU64 uint64
+// cdcU64 decodes a u64 from its decimal JSON string (see cdcU128).
+type cdcU64 uint64
 
-func (f *flexU64) UnmarshalJSON(b []byte) error {
+func (f *cdcU64) UnmarshalJSON(b []byte) error {
 	if len(b) == 0 || string(b) == "null" {
 		*f = 0
 		return nil
 	}
-	var bi *big.Int
-	if b[0] == '"' {
-		var s string
-		if err := json.Unmarshal(b, &s); err != nil {
-			return err
-		}
-		var ok bool
-		bi, ok = new(big.Int).SetString(s, 10)
-		if !ok {
-			return fmt.Errorf("invalid u64 decimal string %q", s)
-		}
-	} else {
-		var n json.Number
-		if err := json.Unmarshal(b, &n); err != nil {
-			return fmt.Errorf("invalid u64 number %s: %w", string(b), err)
-		}
-		var ok bool
-		bi, ok = new(big.Int).SetString(n.String(), 10)
-		if !ok {
-			return fmt.Errorf("invalid u64 number %s", string(b))
-		}
+	var s string
+	if err := json.Unmarshal(b, &s); err != nil {
+		return fmt.Errorf("replay: u64 must be a decimal JSON string, got %s", b)
 	}
-	if !bi.IsUint64() {
-		return fmt.Errorf("u64 value overflows uint64")
+	v, err := strconv.ParseUint(s, 10, 64)
+	if err != nil {
+		return fmt.Errorf("replay: invalid u64 decimal string %q: %w", s, err)
 	}
-	*f = flexU64(bi.Uint64())
+	*f = cdcU64(v)
 	return nil
 }
 
 type cdcTransfer struct {
-	ID          flexU128 `json:"id"`
-	Amount      flexU128 `json:"amount"`
-	PendingID   flexU128 `json:"pending_id"`
-	UserData128 flexU128 `json:"user_data_128"`
-	Code        uint16   `json:"code"`
-	Flags       uint16   `json:"flags"`
-	Timestamp   flexU64  `json:"timestamp"`
+	ID          cdcU128 `json:"id"`
+	Amount      cdcU128 `json:"amount"`
+	PendingID   cdcU128 `json:"pending_id"`
+	UserData128 cdcU128 `json:"user_data_128"`
+	Code        uint16  `json:"code"`
+	Flags       uint16  `json:"flags"`
+	Timestamp   cdcU64  `json:"timestamp"`
 }
 
 type cdcAccount struct {
-	ID flexU128 `json:"id"`
+	ID cdcU128 `json:"id"`
 }
 
 type cdcBody struct {
-	Timestamp     flexU64     `json:"timestamp"`
+	Timestamp     cdcU64      `json:"timestamp"`
 	Type          string      `json:"type"`
 	Ledger        uint32      `json:"ledger"`
 	Transfer      cdcTransfer `json:"transfer"`
@@ -113,7 +82,8 @@ type cdcBody struct {
 
 // ParseMessage decodes a CDC message body into an Event. It derives the pixel
 // coordinates and color for claim events (pending/posted debit the pixel and
-// carry the color in the transfer code).
+// carry the color in the transfer code). Any malformed body — including a
+// missing event type — is an error; the consumer acks it as a poison pill.
 func ParseMessage(body []byte) (Event, error) {
 	var m cdcBody
 	if err := json.Unmarshal(body, &m); err != nil {
@@ -126,7 +96,7 @@ func ParseMessage(body []byte) (Event, error) {
 		Player:     tbclient.Uint128ToUUID(m.Transfer.UserData128.V),
 	}
 	if ev.Type == "" {
-		ev.Type = TypeSingle
+		return Event{}, fmt.Errorf("replay: missing event type")
 	}
 	if m.Transfer.Timestamp != 0 {
 		ev.Timestamp = uint64(m.Transfer.Timestamp)
