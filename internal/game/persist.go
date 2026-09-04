@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
+	"time"
 )
 
 // On-disk snapshot of the derived canvas state, so a restart is O(delta since
@@ -75,6 +76,22 @@ func (s *Service) SaveSnapshot(path string) error {
 	}
 	poolBytes := s.ag.poolBytes
 	s.mu.Unlock()
+
+	// Cross-process exclusion: a second live instance (say, a `go run` server
+	// that a restart script failed to kill) must not interleave its own
+	// temp-write+rename with ours. The sidecar already guards its appends with
+	// a flock; the snapshot gets its own lock file (never renamed, so the lock
+	// inode is stable). The fd stays open across the rename below, so the lock
+	// is held for the whole save and released on return.
+	lockPath := path + ".lock"
+	lf, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return fmt.Errorf("snapshot: lock open: %w", err)
+	}
+	defer lf.Close()
+	if err := syscall.Flock(int(lf.Fd()), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("snapshot: flock: %w", err)
+	}
 
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, ".snapshot-*")
@@ -262,6 +279,26 @@ type anchorBlobLoc struct {
 	Len uint32
 }
 
+// lockAnchorFile grabs the single-writer flock on a fresh sidecar handle,
+// retrying briefly across the restart window. On restart the old server's
+// listener is already gone but its final evictions may still hold the flock;
+// failing fast there would drop those records and tear permanent holes in
+// the append-only sidecar — holes that surface later as bogus timeline
+// data (an idle stretch that suddenly looks repainted).
+func lockAnchorFile(f *os.File) error {
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return err
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+}
+
 // writeAnchorBlob appends one evicted checkpoint to the sidecar file and
 // returns the blob's offset/length. Every eviction writes a record (so the
 // rebooted index keeps each boundary's timestamp); identical states share
@@ -279,9 +316,11 @@ func (s *Service) writeAnchorBlob(tsMs int64, hash uint64, bmp []byte) (int64, u
 			return 0, 0, err
 		}
 		// Single-writer guard: two servers appending to the same sidecar
-		// interleave records and corrupt the index (tsMs inversions). Fail
-		// fast instead.
-		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		// interleave records and corrupt the index (tsMs inversions). Retry
+		// across the restart window instead of failing fast (see
+		// lockAnchorFile), then give up without dropping the checkpoint
+		// silently.
+		if err := lockAnchorFile(f); err != nil {
 			f.Close()
 			return 0, 0, fmt.Errorf("history: anchor sidecar is locked by another process: %w", err)
 		}
@@ -328,7 +367,7 @@ func (s *Service) readAnchorBlobLocked(ref anchorRef) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		if err := syscall.Flock(int(f2.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		if err := lockAnchorFile(f2); err != nil {
 			f2.Close()
 			return nil, fmt.Errorf("history: anchor sidecar is locked by another process: %w", err)
 		}

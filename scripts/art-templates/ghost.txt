@@ -1,0 +1,17 @@
+legend: o=#e4e4e4 x=#4363d8
+................
+....oooooooo....
+..oooooooooooo..
+.oooooooooooooo.
+.ooooxxooooxxoo.
+.ooooxxooooxxoo.
+oooooooooooooooo
+oooooooooooooooo
+oooooooooooooooo
+oooooooooooooooo
+oooooooooooooooo
+oooooooooooooooo
+oooooooooooooooo
+oo.oo.oo.oo.oo.o
+................
+................

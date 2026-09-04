@@ -16,11 +16,14 @@
     <a class="nav" href="/history">⏳ Timelapse</a>
   </header>
 
+  <div class="hint">click once to arm a pixel <b>·</b> click the same pixel again to paint <b>·</b> right-click to pick its color <b>·</b> Esc cancels <b>·</b> keys 1-9,0,a-f choose color</div>
+
   <div id="canvas-wrap">
     <div id="canvas-stack">
       <canvas id="grid" width="{{.Cols}}" height="{{.Rows}}"
               data-init="@get('/sse', {openWhenHidden: true})"></canvas>
       <canvas id="lock-overlay"></canvas>
+      <canvas id="ghost-overlay"></canvas>
     </div>
     <div data-effect="pb.render($bmp, $deltas, $lockAdds, $lockRemoves, $locks)"></div>
   </div>

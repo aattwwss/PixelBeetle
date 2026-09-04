@@ -1,0 +1,17 @@
+legend: o=#ffd600 x=#222222
+................
+....oooooooo....
+..oooooooooooo..
+.oooooooooooooo.
+.oooooooooooooo.
+ooooxxooooxxoooo
+ooooxxooooxxoooo
+oooooooooooooooo
+oooooooooooooooo
+ooxooooooooooxoo
+ooooxooooooxoooo
+oooooxxxxxxooooo
+.oooooooooooooo.
+..oooooooooooo..
+....oooooooo....
+................
